@@ -84,10 +84,11 @@ func (a *App) migrate() {
 func (a *App) seed() {
 	var c int
 	a.db.QueryRow("select count(*) from organizations").Scan(&c)
+	org := "org_dev"
 	if c > 0 {
+		a.ensureSeedQRCommands(org)
 		return
 	}
-	org := "org_dev"
 	a.db.Exec("insert into organizations(id,name)values(?,?)", org, "Example Company")
 	h := hashpw(env("SEED_ADMIN_PASSWORD", "admin123-change-me"))
 	u := "user_admin"
@@ -102,25 +103,45 @@ func (a *App) seed() {
 	for i, p := range prods {
 		a.db.Exec("insert into products(id,organization_id,name,code,unit,active)values(?,?,?,?,?,1)", fmt.Sprintf("prod_%d", i), org, p, fmt.Sprintf("P%d", i+1), "units")
 	}
-	placeIDs := make([]string, 0, len(places))
-	productIDs := make([]string, 0, len(prods))
-	for i := range places {
-		placeIDs = append(placeIDs, fmt.Sprintf("place_%d", i))
+	a.ensureSeedQRCommands(org)
+}
+
+func (a *App) ensureSeedQRCommands(org string) {
+	if len(a.amounts) == 0 {
+		a.amounts = []int{10, 20, 40, 60}
 	}
-	for i := range prods {
-		productIDs = append(productIDs, fmt.Sprintf("prod_%d", i))
-	}
+	placeIDs := a.ids("select id from places where organization_id=? order by id", org)
+	productIDs := a.ids("select id from products where organization_id=? order by id", org)
 	for _, pl := range placeIDs {
 		for _, pr := range productIDs {
 			for _, act := range []string{"add", "subtract"} {
 				for _, amt := range a.amounts {
-					if _, err := a.db.Exec("insert into qr_commands(id,organization_id,place_id,product_id,action,amount,token,active)values(?,?,?,?,?,?,?,1)", id(), org, pl, pr, act, amt, "cmd-"+id()); err != nil {
+					if _, err := a.db.Exec("insert or ignore into qr_commands(id,organization_id,place_id,product_id,action,amount,token,active)values(?,?,?,?,?,?,?,1)", id(), org, pl, pr, act, amt, "cmd-"+id()); err != nil {
 						log.Printf("seed qr command failed: %v", err)
 					}
 				}
 			}
 		}
 	}
+}
+
+func (a *App) ids(query string, arg string) []string {
+	rows, err := a.db.Query(query, arg)
+	if err != nil {
+		log.Printf("seed id query failed: %v", err)
+		return nil
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			log.Printf("seed id scan failed: %v", err)
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
 }
 func (a *App) templates() {
 	a.tmpl = template.Must(template.New("base").Funcs(template.FuncMap{"abs": func(n int) int {

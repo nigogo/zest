@@ -37,6 +37,22 @@ func TestSeedCreatesQRCommands(t *testing.T) {
 		t.Fatalf("qr commands=%d, want 96", c)
 	}
 }
+
+func TestSeedBackfillsMissingQRCommands(t *testing.T) {
+	a := testApp(t)
+	if _, err := a.db.Exec("delete from qr_commands"); err != nil {
+		t.Fatal(err)
+	}
+	a.seed()
+	var c int
+	if err := a.db.QueryRow("select count(*) from qr_commands").Scan(&c); err != nil {
+		t.Fatal(err)
+	}
+	if c != 96 {
+		t.Fatalf("qr commands=%d, want 96 after backfill", c)
+	}
+}
+
 func TestInventoryStockAndReversal(t *testing.T) {
 	a := testApp(t)
 	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('e1','org_dev','place_0','prod_0','user_admin',40,'add')")
