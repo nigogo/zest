@@ -10,13 +10,13 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	_ "modernc.org/sqlite"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
-	_ "zest/internal/shellsqlite"
 )
 
 type App struct {
@@ -64,7 +64,7 @@ func main() {
 		}
 	}
 	os.MkdirAll(filepath.Dir(env("DATABASE_PATH", "./data/app.db")), 0755)
-	db, err := sql.Open("sqlite3", env("DATABASE_PATH", "./data/app.db")+"?_foreign_keys=on")
+	db, err := sql.Open("sqlite", env("DATABASE_PATH", "./data/app.db")+"?_pragma=foreign_keys(1)")
 	must(err)
 	a.db = db
 	a.migrate()

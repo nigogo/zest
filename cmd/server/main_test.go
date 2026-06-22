@@ -2,11 +2,11 @@ package main
 
 import (
 	"database/sql"
+	_ "modernc.org/sqlite"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-	_ "zest/internal/shellsqlite"
 )
 
 func testApp(t *testing.T) *App {
@@ -18,7 +18,7 @@ func testApp(t *testing.T) *App {
 	old := os.Getenv("DATABASE_PATH")
 	os.Setenv("DATABASE_PATH", filepath.Join(dir, "app.db"))
 	t.Cleanup(func() { os.Setenv("DATABASE_PATH", old) })
-	db, err := sql.Open("sqlite3", os.Getenv("DATABASE_PATH"))
+	db, err := sql.Open("sqlite", os.Getenv("DATABASE_PATH")+"?_pragma=foreign_keys(1)")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -9,7 +9,7 @@ Zest is a small, server-rendered Go application for applying inventory movements
 - Server-rendered HTML with mobile-first CSS in `static/app.css`.
 - `.templ` placeholders are included under `templates/` to keep the project shaped for templ adoption; the MVP renders through Go `html/template` to avoid generated-code requirements.
 - HTMX powers the scan-result undo action; hyperscript powers the visible countdown.
-- A tiny local SQLite driver shells out to `sqlite3` in `internal/shellsqlite` so the app builds in this restricted environment without downloading CGO modules.
+- SQLite persistence uses the pure-Go `modernc.org/sqlite` driver, so local development does not require a system `sqlite3` executable.
 
 ## Environment
 
@@ -68,7 +68,6 @@ The scan result page shows an HTMX undo button with a 20-second countdown. The s
 ## Known Limitations
 
 - QR images are placeholder SVG data URIs in this environment; swap in a real QR generator before production printing.
-- The local SQLite driver shells out to `sqlite3`; use a normal SQLite driver in an unrestricted production build.
 - Admin place/product creation routes are intentionally minimal in this MVP.
 - Password hashing is structured in one helper; replace with Argon2id/bcrypt when external crypto modules are available.
 
