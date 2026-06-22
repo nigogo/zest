@@ -102,22 +102,24 @@ func (a *App) seed() {
 	for i, p := range prods {
 		a.db.Exec("insert into products(id,organization_id,name,code,unit,active)values(?,?,?,?,?,1)", fmt.Sprintf("prod_%d", i), org, p, fmt.Sprintf("P%d", i+1), "units")
 	}
-	rows, _ := a.db.Query("select id from places")
-	defer rows.Close()
-	for rows.Next() {
-		var pl string
-		rows.Scan(&pl)
-		prs, _ := a.db.Query("select id from products")
-		for prs.Next() {
-			var pr string
-			prs.Scan(&pr)
+	placeIDs := make([]string, 0, len(places))
+	productIDs := make([]string, 0, len(prods))
+	for i := range places {
+		placeIDs = append(placeIDs, fmt.Sprintf("place_%d", i))
+	}
+	for i := range prods {
+		productIDs = append(productIDs, fmt.Sprintf("prod_%d", i))
+	}
+	for _, pl := range placeIDs {
+		for _, pr := range productIDs {
 			for _, act := range []string{"add", "subtract"} {
 				for _, amt := range a.amounts {
-					a.db.Exec("insert into qr_commands(id,organization_id,place_id,product_id,action,amount,token,active)values(?,?,?,?,?,?,?,1)", id(), org, pl, pr, act, amt, "cmd-"+id())
+					if _, err := a.db.Exec("insert into qr_commands(id,organization_id,place_id,product_id,action,amount,token,active)values(?,?,?,?,?,?,?,1)", id(), org, pl, pr, act, amt, "cmd-"+id()); err != nil {
+						log.Printf("seed qr command failed: %v", err)
+					}
 				}
 			}
 		}
-		prs.Close()
 	}
 }
 func (a *App) templates() {
