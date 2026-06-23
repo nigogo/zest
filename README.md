@@ -25,6 +25,8 @@ UNDO_WINDOW_SECONDS=20
 COMMON_AMOUNTS=10,20,40,60
 SEED_ADMIN_EMAIL=admin@example.com
 SEED_ADMIN_PASSWORD=admin123-change-me
+SEED_USER_EMAIL=user@example.com
+SEED_USER_PASSWORD=password
 ```
 
 ## Setup and Run
@@ -51,9 +53,18 @@ admin@example.com
 admin123-change-me
 ```
 
-These credentials are for local development only. Override them with `SEED_ADMIN_EMAIL` and `SEED_ADMIN_PASSWORD`.
+Development approved operator:
+
+```txt
+user@example.com
+password
+```
+
+These credentials are for local development only. Override them with `SEED_ADMIN_EMAIL`, `SEED_ADMIN_PASSWORD`, `SEED_USER_EMAIL`, and `SEED_USER_PASSWORD`.
 
 ## QR Command Tokens
+
+In development, `/dev/qr-codes` lists every active QR command as a clickable card so you can simulate scanning without a camera.
 
 Inventory QR codes point to `/scan/:commandToken`. The token maps to a `qr_commands` row containing organization, place, product, action, and amount. Product and amount are never accepted from editable query parameters. Inactive commands, places, or products are rejected before an event is created.
 
