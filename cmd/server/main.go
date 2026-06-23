@@ -91,6 +91,7 @@ func (a *App) seed() {
 	a.db.QueryRow("select count(*) from organizations").Scan(&c)
 	org := "org_dev"
 	if c > 0 {
+		a.ensureSeedApprovedUser(org)
 		a.ensureSeedQRCommands(org)
 		return
 	}
@@ -99,6 +100,7 @@ func (a *App) seed() {
 	u := "user_admin"
 	a.db.Exec("insert into users(id,email,name,password_hash)values(?,?,?,?)", u, env("SEED_ADMIN_EMAIL", "admin@example.com"), "Admin", h)
 	a.db.Exec("insert into memberships(id,organization_id,user_id,role,status,approved_at)values(?,?,?,?,?,CURRENT_TIMESTAMP)", "mem_admin", org, u, "admin", "approved")
+	a.ensureSeedApprovedUser(org)
 	a.db.Exec("insert into organization_invites(id,organization_id,token,active)values(?,?,?,1)", "invite_dev", org, "dev-invite-token")
 	places := []string{"Freezer A", "Freezer B", "Freezer C"}
 	prods := []string{"Product A", "Product B", "Product C", "Product D"}
@@ -109,6 +111,19 @@ func (a *App) seed() {
 		a.db.Exec("insert into products(id,organization_id,name,code,unit,active)values(?,?,?,?,?,1)", fmt.Sprintf("prod_%d", i), org, p, fmt.Sprintf("P%d", i+1), "units")
 	}
 	a.ensureSeedQRCommands(org)
+}
+
+func (a *App) ensureSeedApprovedUser(org string) {
+	uid := "user_dev"
+	email := env("SEED_USER_EMAIL", "user@example.com")
+	h := hashpw(env("SEED_USER_PASSWORD", "password"))
+	if _, err := a.db.Exec("insert into users(id,email,name,password_hash)values(?,?,?,?) on conflict(id) do update set email=excluded.email,name=excluded.name,password_hash=excluded.password_hash", uid, email, "Development User", h); err != nil {
+		log.Printf("seed approved user failed: %v", err)
+		return
+	}
+	if _, err := a.db.Exec("insert into memberships(id,organization_id,user_id,role,status,approved_at)values(?,?,?,?,?,CURRENT_TIMESTAMP) on conflict(organization_id,user_id) do update set status=excluded.status,approved_at=CURRENT_TIMESTAMP", "mem_dev", org, uid, "operator", "approved"); err != nil {
+		log.Printf("seed approved user membership failed: %v", err)
+	}
 }
 
 func (a *App) ensureSeedQRCommands(org string) {
@@ -228,6 +243,7 @@ func (a *App) routes(m *http.ServeMux) {
 	m.HandleFunc("/logout", a.logout)
 	m.HandleFunc("/org/join/", a.join)
 	m.HandleFunc("/scan/", a.scan)
+	m.HandleFunc("/dev/qr-codes", a.devQRCodes)
 	m.HandleFunc("/events/", a.eventRoutes)
 	m.HandleFunc("/events", a.events)
 	m.HandleFunc("/places/", a.placeToken)
@@ -542,6 +558,33 @@ func (a *App) qrMatrix(w http.ResponseWriter, r *http.Request, c Ctx) {
 	a.render(w, r, "qr", out)
 }
 
+func (a *App) devQRCodes(w http.ResponseWriter, r *http.Request) {
+	if a.env == "production" {
+		http.NotFound(w, r)
+		return
+	}
+	c, ok := a.approved(w, r)
+	if !ok {
+		return
+	}
+	rows, err := a.db.Query(`select pl.name,pr.name,q.action,q.amount,q.token from qr_commands q join places pl on pl.id=q.place_id join products pr on pr.id=q.product_id where q.organization_id=? and q.active=1 and pl.active=1 and pr.active=1 order by pl.name,pr.name,q.action,q.amount`, c.OrgID)
+	if err != nil {
+		http.Error(w, "could not load QR commands", 500)
+		return
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var place, prod, act, tok string
+		var amt int
+		rows.Scan(&place, &prod, &act, &amt, &tok)
+		scanURL := "/scan/" + tok
+		svg := "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString([]byte("<svg xmlns='http://www.w3.org/2000/svg' width='96' height='96'><rect width='96' height='96' fill='white'/><rect x='8' y='8' width='80' height='80' fill='none' stroke='black'/><text x='48' y='52' font-size='10' text-anchor='middle'>QR</text></svg>"))
+		out = append(out, map[string]any{"Place": place, "Product": prod, "Action": act, "Amount": amt, "Href": scanURL, "Img": svg})
+	}
+	a.render(w, r, "devqr", out)
+}
+
 func (a *App) reports(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.approved(w, r)
 	if !ok {
@@ -566,9 +609,9 @@ func (a *App) csv(w http.ResponseWriter, r *http.Request) {
 
 var _ = context.Background
 
-const tpl = `{{define "layout"}}<!doctype html><html><head><title>{{.Title}}</title><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/app.css"><script src="https://unpkg.com/htmx.org@1.9.12"></script><script src="https://unpkg.com/hyperscript.org@0.9.12"></script></head><body><header><a href="/places">Places</a> <a href="/events">Events</a> <a href="/reports">Reports</a> <a href="/admin">Admin</a>{{if .Ctx.Authed}}<form method="post" action="/logout">{{csrf .Ctx}}<button>Logout</button></form>{{end}}</header><main>{{template "body" .}}</main></body></html>{{end}}
+const tpl = `{{define "layout"}}<!doctype html><html><head><title>{{.Title}}</title><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/app.css"><script src="https://unpkg.com/htmx.org@1.9.12"></script><script src="https://unpkg.com/hyperscript.org@0.9.12"></script></head><body><header><a href="/places">Places</a> <a href="/events">Events</a> <a href="/reports">Reports</a> <a href="/admin">Admin</a> <a href="/dev/qr-codes">Dev QRs</a>{{if .Ctx.Authed}}<form method="post" action="/logout">{{csrf .Ctx}}<button>Logout</button></form>{{end}}</header><main>{{template "body" .}}</main></body></html>{{end}}
 {{define "login"}}{{template "layout" .}}{{end}}{{define "body"}}{{if eq .Title "login"}}<section class="card"><h1>Login</h1><form method="post"><input type="hidden" name="return" value="{{.Data}}"><label>Email<input name="email"></label><label>Password<input name="password" type="password"></label><button>Login</button></form><a href="/register">Register</a></section>{{else}}{{template "body2" .}}{{end}}{{end}}
-{{define "body2"}}{{if eq .Title "register"}}<section class="card"><h1>Register</h1><form method="post"><label>Name<input name="name"></label><label>Email<input name="email"></label><label>Password<input name="password" type="password"></label><button>Create account</button></form></section>{{else if eq .Title "waiting"}}<section class="card"><h1>Your account is waiting for approval.</h1><p>Organization: Example Company</p><p>An admin must approve you before you can change inventory.</p></section>{{else if eq .Title "error"}}<section class="card error"><h1>Problem</h1><p>{{index .Data "Message"}}</p></section>{{else if eq .Title "places"}}<h1>Places</h1>{{range .Data}}<a class="row" href="/places/{{.Token}}">{{.Name}}</a>{{end}}{{else if eq .Title "place"}}<h1>{{index .Data "Name"}}</h1>{{range index .Data "Stocks"}}<div class="stock"><b>{{.Name}}</b><span>{{.Qty}} {{.Unit}}</span></div>{{end}}<a href="/events">Recent events</a>{{else if eq .Title "events"}}<h1>Recent events</h1>{{range .Data}}<div class="row"><b>{{.Time}}</b> {{.User}} {{.Qty}} {{.Product}} {{.Place}} <em>{{.Type}}</em></div>{{end}}{{else if eq .Title "admin"}}<h1>Admin</h1><nav class="grid"><a href="/admin/memberships">Memberships</a><a href="/admin/places">Places</a><a href="/admin/products">Products</a><a href="/admin/events">Events</a></nav>{{else if eq .Title "members"}}<h1>Memberships</h1>{{range .Data}}<div class="row">{{.Email}} {{.Status}} <form method="post" action="/admin/memberships/{{.ID}}/approve">{{csrf $.Ctx}}<button>Approve</button></form><form method="post" action="/admin/memberships/{{.ID}}/reject">{{csrf $.Ctx}}<button>Reject</button></form></div>{{end}}{{else if eq .Title "products"}}<h1>Products</h1><p>Product administration is intentionally simple in this MVP; seed products are active.</p>{{else if eq .Title "qr"}}<h1>QR Matrix</h1><div class="qrgrid">{{range .Data}}<div class="qr"><img src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}</div>{{else if eq .Title "reports"}}<h1>Reports</h1><a href="/reports/export.csv">Export CSV</a>{{range .Data}}<div class="row">{{.Time}} {{.Qty}} {{.Product}} {{.Place}}</div>{{end}}{{else if eq .Title "result"}}<section class="result"><h1>{{if gt (index .Data "Delta") 0}}ADDED{{else if lt (index .Data "Delta") 0}}SUBTRACTED{{else}}EVENT{{end}}</h1><div class="big">{{index .Data "Amount"}} × {{index .Data "Product"}}</div><p>{{if gt (index .Data "Delta") 0}}to{{else}}from{{end}} {{index .Data "Place"}}</p><p>Current {{index .Data "Product"}} stock here: <b>{{index .Data "Stock"}} {{index .Data "Unit"}}</b></p>{{if index .Data "Negative"}}<p class="warn">Warning: stock is now negative.</p>{{end}}<div id="undo">{{if not (index .Data "Reversed")}}<form hx-post="/events/{{index .Data "ID"}}/undo" hx-target="#undo" method="post">{{csrf .Ctx}}<button class="danger" _="on load set n to {{index .Data "UndoSeconds"}} then repeat while n > 0 set my.innerText to 'Undo ' + n + 's' wait 1s decrement n end then set my.disabled to true then set my.innerText to 'Undo window expired'">Undo</button></form>{{else}}Undone{{end}}</div><a class="button" href="/places">Scan next</a></section>{{end}}{{end}}
+{{define "body2"}}{{if eq .Title "register"}}<section class="card"><h1>Register</h1><form method="post"><label>Name<input name="name"></label><label>Email<input name="email"></label><label>Password<input name="password" type="password"></label><button>Create account</button></form></section>{{else if eq .Title "waiting"}}<section class="card"><h1>Your account is waiting for approval.</h1><p>Organization: Example Company</p><p>An admin must approve you before you can change inventory.</p></section>{{else if eq .Title "error"}}<section class="card error"><h1>Problem</h1><p>{{index .Data "Message"}}</p></section>{{else if eq .Title "places"}}<h1>Places</h1>{{range .Data}}<a class="row" href="/places/{{.Token}}">{{.Name}}</a>{{end}}{{else if eq .Title "place"}}<h1>{{index .Data "Name"}}</h1>{{range index .Data "Stocks"}}<div class="stock"><b>{{.Name}}</b><span>{{.Qty}} {{.Unit}}</span></div>{{end}}<a href="/events">Recent events</a>{{else if eq .Title "events"}}<h1>Recent events</h1>{{range .Data}}<div class="row"><b>{{.Time}}</b> {{.User}} {{.Qty}} {{.Product}} {{.Place}} <em>{{.Type}}</em></div>{{end}}{{else if eq .Title "admin"}}<h1>Admin</h1><nav class="grid"><a href="/admin/memberships">Memberships</a><a href="/admin/places">Places</a><a href="/admin/products">Products</a><a href="/admin/events">Events</a></nav>{{else if eq .Title "members"}}<h1>Memberships</h1>{{range .Data}}<div class="row">{{.Email}} {{.Status}} <form method="post" action="/admin/memberships/{{.ID}}/approve">{{csrf $.Ctx}}<button>Approve</button></form><form method="post" action="/admin/memberships/{{.ID}}/reject">{{csrf $.Ctx}}<button>Reject</button></form></div>{{end}}{{else if eq .Title "products"}}<h1>Products</h1><p>Product administration is intentionally simple in this MVP; seed products are active.</p>{{else if eq .Title "qr"}}<h1>QR Matrix</h1><div class="qrgrid">{{range .Data}}<div class="qr"><img src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}</div>{{else if eq .Title "devqr"}}<h1>Development QR Codes</h1><p>Click any QR card to simulate scanning that code.</p><div class="qrgrid">{{range .Data}}<a class="qr" href="{{.Href}}"><img src="{{.Img}}"><small>{{.Place}} · {{.Product}} · {{.Action}} {{.Amount}}</small></a>{{end}}</div>{{else if eq .Title "reports"}}<h1>Reports</h1><a href="/reports/export.csv">Export CSV</a>{{range .Data}}<div class="row">{{.Time}} {{.Qty}} {{.Product}} {{.Place}}</div>{{end}}{{else if eq .Title "result"}}<section class="result"><h1>{{if gt (index .Data "Delta") 0}}ADDED{{else if lt (index .Data "Delta") 0}}SUBTRACTED{{else}}EVENT{{end}}</h1><div class="big">{{index .Data "Amount"}} × {{index .Data "Product"}}</div><p>{{if gt (index .Data "Delta") 0}}to{{else}}from{{end}} {{index .Data "Place"}}</p><p>Current {{index .Data "Product"}} stock here: <b>{{index .Data "Stock"}} {{index .Data "Unit"}}</b></p>{{if index .Data "Negative"}}<p class="warn">Warning: stock is now negative.</p>{{end}}<div id="undo">{{if not (index .Data "Reversed")}}<form hx-post="/events/{{index .Data "ID"}}/undo" hx-target="#undo" method="post">{{csrf .Ctx}}<button class="danger" _="on load set n to {{index .Data "UndoSeconds"}} then repeat while n > 0 set my.innerText to 'Undo ' + n + 's' wait 1s decrement n end then set my.disabled to true then set my.innerText to 'Undo window expired'">Undo</button></form>{{else}}Undone{{end}}</div><a class="button" href="/places">Scan next</a></section>{{end}}{{end}}
 {{define "register"}}{{template "layout" .}}{{end}}
 {{define "waiting"}}{{template "layout" .}}{{end}}
 {{define "error"}}{{template "layout" .}}{{end}}
@@ -579,6 +622,7 @@ const tpl = `{{define "layout"}}<!doctype html><html><head><title>{{.Title}}</ti
 {{define "members"}}{{template "layout" .}}{{end}}
 {{define "products"}}{{template "layout" .}}{{end}}
 {{define "qr"}}{{template "layout" .}}{{end}}
+{{define "devqr"}}{{template "layout" .}}{{end}}
 {{define "reports"}}{{template "layout" .}}{{end}}
 {{define "result"}}{{template "layout" .}}{{end}}
 `

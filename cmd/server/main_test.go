@@ -3,8 +3,11 @@ package main
 import (
 	"database/sql"
 	_ "modernc.org/sqlite"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -22,7 +25,7 @@ func testApp(t *testing.T) *App {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := &App{db: db, base: "http://example.test", undoWindow: 20 * time.Second, amounts: []int{10, 20, 40, 60}}
+	a := &App{db: db, base: "http://example.test", env: "development", undoWindow: 20 * time.Second, amounts: []int{10, 20, 40, 60}}
 	a.migrate()
 	a.seed()
 	return a
@@ -74,5 +77,49 @@ func TestNegativeStockAllowed(t *testing.T) {
 func TestPasswordHashStable(t *testing.T) {
 	if hashpw("secret") == "secret" || hashpw("secret") != hashpw("secret") {
 		t.Fatal("hash should be non-plain and stable")
+	}
+}
+
+func TestSeedCreatesApprovedDevelopmentUser(t *testing.T) {
+	a := testApp(t)
+	var role, status, hash string
+	if err := a.db.QueryRow(`select m.role,m.status,u.password_hash from users u join memberships m on m.user_id=u.id where u.email=?`, "user@example.com").Scan(&role, &status, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if role != "operator" || status != "approved" || hash != hashpw("password") {
+		t.Fatalf("seed user role=%q status=%q hash matches=%v, want approved operator with simple password", role, status, hash == hashpw("password"))
+	}
+}
+
+func TestDevQRCodesPageLinksToScanRoutes(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=user%40example.com&password=password"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRec := httptest.NewRecorder()
+	mux.ServeHTTP(loginRec, login)
+	if loginRec.Code != http.StatusFound {
+		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
+	}
+	cookies := loginRec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("login did not set a session cookie")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/dev/qr-codes", nil)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dev qr status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Development QR Codes") || !strings.Contains(body, "href=\"/scan/cmd-") || !strings.Contains(body, "Click any QR card") {
+		t.Fatalf("dev QR page did not include clickable scan links: %s", body)
 	}
 }
