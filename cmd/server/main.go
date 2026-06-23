@@ -10,13 +10,14 @@ import (
 	"fmt"
 	"html/template"
 	"log"
-	_ "modernc.org/sqlite"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 type App struct {
@@ -49,13 +50,15 @@ func hashpw(p string) string {
 	s := sha256.Sum256([]byte("zest-dev-salt:" + p))
 	return base64.RawURLEncoding.EncodeToString(s[:])
 }
+
 func must(err error) {
 	if err != nil {
 		log.Fatal(err)
 	}
 }
+
 func main() {
-	a := &App{base: env("APP_BASE_URL", "http://localhost:8080"), addr: env("APP_ADDR", ":8080"), env: env("APP_ENV", "development"), undoWindow: 20 * time.Second}
+	a := &App{base: env("APP_BASE_URL", "http://localhost:8765"), addr: env("APP_ADDR", ":8765"), env: env("APP_ENV", "development"), undoWindow: 20 * time.Second}
 	a.secure = a.env == "production"
 	for _, s := range strings.Split(env("COMMON_AMOUNTS", "10,20,40,60"), ",") {
 		n, _ := strconv.Atoi(strings.TrimSpace(s))
@@ -75,12 +78,14 @@ func main() {
 	log.Println("listening", a.addr)
 	must(http.ListenAndServe(a.addr, mux))
 }
+
 func (a *App) migrate() {
 	b, err := os.ReadFile("migrations/001_init.sql")
 	must(err)
 	_, err = a.db.Exec(string(b))
 	must(err)
 }
+
 func (a *App) seed() {
 	var c int
 	a.db.QueryRow("select count(*) from organizations").Scan(&c)
@@ -143,6 +148,7 @@ func (a *App) ids(query string, arg string) []string {
 	}
 	return ids
 }
+
 func (a *App) templates() {
 	a.tmpl = template.Must(template.New("base").Funcs(template.FuncMap{"abs": func(n int) int {
 		if n < 0 {
@@ -153,10 +159,12 @@ func (a *App) templates() {
 		return template.HTML(`<input type="hidden" name="csrf" value="` + template.HTMLEscapeString(c.CSRF) + `">`)
 	}}).Parse(tpl))
 }
+
 func (a *App) render(w http.ResponseWriter, r *http.Request, name string, d any) {
 	c := a.ctx(r)
 	a.tmpl.ExecuteTemplate(w, name, Page{Title: name, Ctx: c, Data: d})
 }
+
 func (a *App) ctx(r *http.Request) Ctx {
 	ck, err := r.Cookie("sid")
 	if err != nil {
@@ -170,6 +178,7 @@ func (a *App) ctx(r *http.Request) Ctx {
 	}
 	return c
 }
+
 func (a *App) need(w http.ResponseWriter, r *http.Request) (Ctx, bool) {
 	c := a.ctx(r)
 	if !c.Authed {
@@ -178,6 +187,7 @@ func (a *App) need(w http.ResponseWriter, r *http.Request) (Ctx, bool) {
 	}
 	return c, true
 }
+
 func (a *App) approved(w http.ResponseWriter, r *http.Request) (Ctx, bool) {
 	c, ok := a.need(w, r)
 	if !ok {
@@ -189,6 +199,7 @@ func (a *App) approved(w http.ResponseWriter, r *http.Request) (Ctx, bool) {
 	}
 	return c, true
 }
+
 func (a *App) admin(w http.ResponseWriter, r *http.Request) (Ctx, bool) {
 	c, ok := a.approved(w, r)
 	if !ok {
@@ -200,6 +211,7 @@ func (a *App) admin(w http.ResponseWriter, r *http.Request) (Ctx, bool) {
 	}
 	return c, true
 }
+
 func (a *App) checkPost(w http.ResponseWriter, r *http.Request, c Ctx) bool {
 	if r.Method == "POST" && r.FormValue("csrf") != c.CSRF {
 		http.Error(w, "bad csrf", 403)
@@ -207,6 +219,7 @@ func (a *App) checkPost(w http.ResponseWriter, r *http.Request, c Ctx) bool {
 	}
 	return true
 }
+
 func (a *App) routes(m *http.ServeMux) {
 	m.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/places", 302) })
@@ -228,6 +241,7 @@ func (a *App) routes(m *http.ServeMux) {
 		}
 	})
 }
+
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		a.render(w, r, "login", r.URL.Query().Get("return"))
@@ -248,6 +262,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	}
 	http.Redirect(w, r, ret, 302)
 }
+
 func (a *App) register(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		a.render(w, r, "register", nil)
@@ -265,6 +280,7 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{Name: "sid", Value: tok, Path: "/", HttpOnly: true, Secure: a.secure, SameSite: http.SameSiteLaxMode})
 	http.Redirect(w, r, "/places", 302)
 }
+
 func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 	c, _ := a.need(w, r)
 	if !a.checkPost(w, r, c) {
@@ -275,6 +291,7 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 	}
 	http.Redirect(w, r, "/login", 302)
 }
+
 func (a *App) join(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.need(w, r)
 	if !ok {
@@ -289,6 +306,7 @@ func (a *App) join(w http.ResponseWriter, r *http.Request) {
 	a.db.Exec("insert or ignore into memberships(id,organization_id,user_id,role,status)values(?,?,?,?,?)", id(), org, c.UserID, "operator", "pending")
 	a.render(w, r, "waiting", nil)
 }
+
 func (a *App) scan(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.approved(w, r)
 	if !ok {
@@ -318,6 +336,7 @@ func (a *App) scan(w http.ResponseWriter, r *http.Request) {
 	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type)values(?,?,?,?,?,?,?)", eid, org, pl, pr, c.UserID, delta, act)
 	http.Redirect(w, r, "/events/"+eid+"/result", 303)
 }
+
 func (a *App) eventRoutes(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(r.URL.Path, "/undo") {
 		a.undo(w, r)
@@ -329,9 +348,11 @@ func (a *App) eventRoutes(w http.ResponseWriter, r *http.Request) {
 	}
 	http.NotFound(w, r)
 }
+
 func (a *App) eventID(path, suf string) string {
 	return strings.TrimSuffix(strings.TrimPrefix(path, "/events/"), suf)
 }
+
 func (a *App) result(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.approved(w, r)
 	if !ok {
@@ -345,6 +366,7 @@ func (a *App) result(w http.ResponseWriter, r *http.Request) {
 	}
 	a.render(w, r, "result", row)
 }
+
 func (a *App) eventData(eid, org string) map[string]any {
 	var place, prod, unit, etype, uid, created string
 	var delta, stock, rev int
@@ -354,12 +376,14 @@ func (a *App) eventData(eid, org string) map[string]any {
 	}
 	return map[string]any{"ID": eid, "Place": place, "Product": prod, "Unit": unit, "Type": etype, "Delta": delta, "Amount": abs(delta), "Stock": stock, "Reversed": rev > 0, "UndoSeconds": int(a.undoWindow.Seconds()), "Created": created, "Negative": stock < 0}
 }
+
 func abs(n int) int {
 	if n < 0 {
 		return -n
 	}
 	return n
 }
+
 func (a *App) undo(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.approved(w, r)
 	if !ok {
@@ -394,6 +418,7 @@ func (a *App) undo(w http.ResponseWriter, r *http.Request) {
 	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type,reversed_event_id,note)values(?,?,?,?,?,?,?,?,?)", id(), org, pl, pr, c.UserID, -delta, "reversal", eid, "Undo")
 	fmt.Fprint(w, "<div class='success'><strong>Undone</strong><p>A reversal event was created.</p></div>")
 }
+
 func (a *App) places(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.approved(w, r)
 	if !ok {
@@ -409,6 +434,7 @@ func (a *App) places(w http.ResponseWriter, r *http.Request) {
 	}
 	a.render(w, r, "places", v)
 }
+
 func (a *App) placeToken(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.approved(w, r)
 	if !ok {
@@ -431,6 +457,7 @@ func (a *App) placeToken(w http.ResponseWriter, r *http.Request) {
 	rows.Close()
 	a.render(w, r, "place", map[string]any{"Name": name, "Stocks": stocks})
 }
+
 func (a *App) events(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.approved(w, r)
 	if !ok {
@@ -438,6 +465,7 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 	}
 	a.render(w, r, "events", a.listEvents(c.OrgID))
 }
+
 func (a *App) listEvents(org string) []map[string]any {
 	rows, _ := a.db.Query(`select e.created_at,u.name,e.quantity_delta,pr.name,pl.name,e.event_type from inventory_events e join users u on u.id=e.user_id join products pr on pr.id=e.product_id join places pl on pl.id=e.place_id where e.organization_id=? order by e.created_at desc limit 100`, org)
 	defer rows.Close()
@@ -450,6 +478,7 @@ func (a *App) listEvents(org string) []map[string]any {
 	}
 	return out
 }
+
 func (a *App) adminRoutes(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.admin(w, r)
 	if !ok {
@@ -498,6 +527,7 @@ func (a *App) adminRoutes(w http.ResponseWriter, r *http.Request) {
 	}
 	http.NotFound(w, r)
 }
+
 func (a *App) qrMatrix(w http.ResponseWriter, r *http.Request, c Ctx) {
 	pid := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/admin/places/"), "/qr-matrix")
 	rows, _ := a.db.Query(`select q.action,q.amount,pr.name,q.token from qr_commands q join products pr on pr.id=q.product_id where q.organization_id=? and q.place_id=? and q.active=1 and pr.active=1 order by q.action,pr.name,q.amount`, c.OrgID, pid)
@@ -511,6 +541,7 @@ func (a *App) qrMatrix(w http.ResponseWriter, r *http.Request, c Ctx) {
 	}
 	a.render(w, r, "qr", out)
 }
+
 func (a *App) reports(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.approved(w, r)
 	if !ok {
@@ -518,6 +549,7 @@ func (a *App) reports(w http.ResponseWriter, r *http.Request) {
 	}
 	a.render(w, r, "reports", a.listEvents(c.OrgID))
 }
+
 func (a *App) csv(w http.ResponseWriter, r *http.Request) {
 	c, ok := a.approved(w, r)
 	if !ok {
