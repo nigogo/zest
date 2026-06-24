@@ -122,4 +122,7 @@ func TestDevQRCodesPageLinksToScanRoutes(t *testing.T) {
 	if !strings.Contains(body, "Development QR Codes") || !strings.Contains(body, "href=\"/scan/cmd-") || !strings.Contains(body, "Click any QR card") || !strings.Contains(body, "api.qrserver.com/v1/create-qr-code") || !strings.Contains(body, "Print matrix") {
 		t.Fatalf("dev QR page did not include clickable scan links and QR images: %s", body)
 	}
+	if strings.Contains(body, "qr-url") || strings.Contains(body, "</span></a>") {
+		t.Fatalf("dev QR page should not render URL captions: %s", body)
+	}
 }
