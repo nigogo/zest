@@ -126,3 +126,50 @@ func TestDevQRCodesPageLinksToScanRoutes(t *testing.T) {
 		t.Fatalf("dev QR page should not render URL captions: %s", body)
 	}
 }
+
+func TestPreferredLanguageUsesAcceptLanguage(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/login", nil)
+	req.Header.Set("Accept-Language", "de-DE,de;q=0.9,en;q=0.8")
+	if got := preferredLang(req); got != "de" {
+		t.Fatalf("preferredLang=%q, want de", got)
+	}
+}
+
+func TestSettingsPersistsLanguagePreference(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=user%40example.com&password=password"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRec := httptest.NewRecorder()
+	mux.ServeHTTP(loginRec, login)
+	if loginRec.Code != http.StatusFound {
+		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
+	}
+	cookies := loginRec.Result().Cookies()
+
+	var csrf string
+	if err := a.db.QueryRow("select csrf from sessions where user_id='user_dev'").Scan(&csrf); err != nil {
+		t.Fatal(err)
+	}
+	form := "csrf=" + csrf + "&language=de"
+	req := httptest.NewRequest(http.MethodPost, "/settings", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("settings status=%d, want %d", rec.Code, http.StatusSeeOther)
+	}
+	var lang string
+	if err := a.db.QueryRow("select language from users where id='user_dev'").Scan(&lang); err != nil {
+		t.Fatal(err)
+	}
+	if lang != "de" {
+		t.Fatalf("language=%q, want de", lang)
+	}
+}
