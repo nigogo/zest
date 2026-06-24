@@ -5,6 +5,7 @@ Zest is a small, server-rendered Go application for applying inventory movements
 ## Architecture
 
 - Go `net/http` server in `cmd/server/main.go`.
+- Internationalization resolves each request from the user's saved language or, if unset, the browser/device `Accept-Language` header.
 - SQLite schema in `migrations/001_init.sql`.
 - Server-rendered HTML with mobile-first CSS in `static/app.css`.
 - `.templ` placeholders are included under `templates/` to keep the project shaped for templ adoption; the MVP renders through Go `html/template` to avoid generated-code requirements.
@@ -43,6 +44,8 @@ air
 ```
 
 The database migrates and development seed data is created on first startup.
+
+Users can choose English, German, or device default from `/settings`; that preference is stored in SQLite.
 
 ## Seed Credentials
 

@@ -32,6 +32,7 @@ type App struct {
 type Ctx struct {
 	UserID, OrgID, Role, Status, CSRF string
 	Authed                            bool
+	Lang, LangPref                    string
 }
 type Page struct {
 	Title string
@@ -84,6 +85,30 @@ func (a *App) migrate() {
 	b, err := os.ReadFile("migrations/001_init.sql")
 	must(err)
 	_, err = a.db.Exec(string(b))
+	must(err)
+	a.ensureColumn("users", "language", "TEXT NOT NULL DEFAULT ''")
+}
+
+func (a *App) ensureColumn(table, column, definition string) {
+	rows, err := a.db.Query("pragma table_info(" + table + ")")
+	if err != nil {
+		must(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			must(err)
+		}
+		if name == column {
+			return
+		}
+	}
+	_, err = a.db.Exec("alter table " + table + " add column " + column + " " + definition)
 	must(err)
 }
 
@@ -166,7 +191,7 @@ func (a *App) ids(query string, arg string) []string {
 }
 
 func (a *App) templates() {
-	a.tmpl = template.Must(template.New("base").Funcs(template.FuncMap{"productClass": productClass, "eventSign": eventSign, "abs": func(n int) int {
+	a.tmpl = template.Must(template.New("base").Funcs(template.FuncMap{"productClass": productClass, "eventSign": eventSign, "eventText": eventText, "unit": unitLabel, "t": tr, "abs": func(n int) int {
 		if n < 0 {
 			return -n
 		}
@@ -178,19 +203,27 @@ func (a *App) templates() {
 
 func (a *App) render(w http.ResponseWriter, r *http.Request, name string, d any) {
 	c := a.ctx(r)
+	c.Lang = c.LangPref
+	if c.Lang == "" {
+		c.Lang = preferredLang(r)
+	}
 	a.tmpl.ExecuteTemplate(w, name, Page{Title: name, Ctx: c, Data: d})
 }
 
 func (a *App) ctx(r *http.Request) Ctx {
 	ck, err := r.Cookie("sid")
 	if err != nil {
-		return Ctx{}
+		return Ctx{Lang: preferredLang(r)}
 	}
 	var c Ctx
 	c.Authed = true
-	err = a.db.QueryRow("select s.user_id,s.csrf,coalesce(m.organization_id,''),coalesce(m.role,''),coalesce(m.status,'') from sessions s left join memberships m on m.user_id=s.user_id where s.token=? and s.expires_at>datetime('now') order by m.created_at limit 1", ck.Value).Scan(&c.UserID, &c.CSRF, &c.OrgID, &c.Role, &c.Status)
+	err = a.db.QueryRow("select s.user_id,s.csrf,coalesce(m.organization_id,''),coalesce(m.role,''),coalesce(m.status,''),coalesce(u.language,'') from sessions s join users u on u.id=s.user_id left join memberships m on m.user_id=s.user_id where s.token=? and s.expires_at>datetime('now') order by m.created_at limit 1", ck.Value).Scan(&c.UserID, &c.CSRF, &c.OrgID, &c.Role, &c.Status, &c.LangPref)
 	if err != nil {
-		return Ctx{}
+		return Ctx{Lang: preferredLang(r)}
+	}
+	c.Lang = c.LangPref
+	if c.Lang == "" {
+		c.Lang = preferredLang(r)
 	}
 	return c
 }
@@ -210,7 +243,7 @@ func (a *App) approved(w http.ResponseWriter, r *http.Request) (Ctx, bool) {
 		return c, false
 	}
 	if c.Status != "approved" {
-		a.render(w, r, "error", map[string]string{"Message": "Your account is waiting for approval or access was rejected."})
+		a.render(w, r, "error", map[string]string{"Message": tr(c, "error.waiting")})
 		return c, false
 	}
 	return c, true
@@ -236,6 +269,349 @@ func (a *App) checkPost(w http.ResponseWriter, r *http.Request, c Ctx) bool {
 	return true
 }
 
+func langSupported(lang string) bool {
+	return lang == "en" || lang == "de"
+}
+
+func preferredLang(r *http.Request) string {
+	for _, part := range strings.Split(r.Header.Get("Accept-Language"), ",") {
+		code := strings.ToLower(strings.TrimSpace(strings.Split(part, ";")[0]))
+		if len(code) >= 2 && langSupported(code[:2]) {
+			return code[:2]
+		}
+	}
+	return "en"
+}
+
+var messages = map[string]map[string]string{
+	"de": germanMessages,
+}
+
+var germanMessages = map[string]string{
+	"nav.places":              "Orte",
+	"nav.events":              "Ereignisse",
+	"nav.admin":               "Admin",
+	"nav.settings":            "Einstellungen",
+	"nav.logout":              "Abmelden",
+	"login.tag":               "Scannen. Buchen. Fertig.",
+	"login.title":             "Anmelden",
+	"login.copy":              "Schnelle Bestandsführung für die Praxis.",
+	"login.email":             "E-Mail",
+	"login.password":          "Passwort",
+	"login.submit":            "Anmelden",
+	"login.register":          "Konto erstellen",
+	"register.tag":            "Team beitreten",
+	"register.title":          "Konto erstellen",
+	"register.name":           "Name",
+	"register.submit":         "Konto erstellen",
+	"waiting.eyebrow":         "Warten auf Freigabe",
+	"waiting.title":           "Warten auf Freigabe",
+	"waiting.added":           "Dein Konto wurde zu Example Company hinzugefügt.",
+	"waiting.copy":            "Ein Admin muss dich freigeben, bevor du Bestand ändern kannst.",
+	"waiting.switch":          "Anderes Konto verwenden",
+	"error.eyebrow":           "Zest kann nicht fortfahren",
+	"error.home":              "Zur Startseite",
+	"error.login":             "Anmelden",
+	"error.waiting":           "Dein Konto wartet auf Freigabe oder der Zugriff wurde abgelehnt.",
+	"error.invalid_invite":    "Ungültige Einladung.",
+	"error.invalid_qr":        "Dieser QR-Code ist ungültig oder nicht mehr aktiv.",
+	"error.inactive_qr":       "Dieser QR-Code verweist auf einen inaktiven Ort oder ein inaktives Produkt.",
+	"action.add":              "Hinzufügen",
+	"action.subtract":         "Entnehmen",
+	"action.add_section":      "HINZUFÜGEN",
+	"action.subtract_section": "ENTNEHMEN",
+	"settings.title":          "Einstellungen",
+	"settings.language":       "Sprache",
+	"settings.device":         "Gerätesprache",
+	"settings.english":        "Englisch",
+	"settings.german":         "Deutsch",
+	"settings.save":           "Einstellungen speichern",
+	"settings.saved":          "Einstellungen gespeichert.",
+	"settings.copy":           "Wähle eine Sprache oder verwende die Standardsprache deines Geräts.",
+	"places.eyebrow":          "Operator-Orte",
+	"places.title":            "Orte",
+	"places.copy":             "Öffne einen Ort, scanne einen Befehls-QR-Code und arbeite weiter.",
+	"places.devqr":            "Dev-QRs",
+	"places.active":           "Aktiv",
+	"places.cardcopy":         "Aktuellen Bestand und letzte Bewegungen ansehen.",
+	"places.empty":            "Noch keine aktiven Orte.",
+	"place.eyebrow":           "Aktiver Ort",
+	"place.stock":             "Aktueller Bestand je Produkt.",
+	"place.approved":          "Freigegeben",
+	"place.here":              "hier",
+	"place.zero":              "Nullbestand.",
+	"place.negative":          "Negativer Bestand. Prüfe die letzte Bewegung.",
+	"place.recent":            "Letzte Aktivität",
+	"place.viewall":           "Alle anzeigen",
+	"place.recentempty":       "Letzte Bewegungen erscheinen nach Scans.",
+	"place.scannext":          "Weiter scannen",
+	"events.eyebrow":          "Audit-Zeitleiste",
+	"events.title":            "Letzte Ereignisse",
+	"events.empty":            "Noch keine Ereignisse.",
+	"events.added":            "Hinzugefügt",
+	"events.subtracted":       "Entnommen",
+	"events.reversal":         "Storno von",
+	"admin.backoffice":        "Backoffice",
+	"admin.title":             "Admin-Dashboard",
+	"admin.approvals":         "Ausstehende Freigaben",
+	"admin.products":          "Produkte",
+	"admin.reports":           "Berichte",
+	"admin.settings":          "Einstellungen",
+	"admin.total":             "Gesamtbestand",
+	"admin.today":             "Ereignisse heute",
+	"admin.negative":          "Negativer Bestand",
+	"admin.activeplaces":      "Aktive Orte",
+	"admin.activeproducts":    "Aktive Produkte",
+	"admin.reports_settings":  "Berichte und Einstellungen",
+	"admin.coming_soon":       "Erweiterte Diagramme, Warnungen und Konfiguration folgen demnächst.",
+	"members.user":            "Benutzer",
+	"members.status":          "Status",
+	"members.actions":         "Aktionen",
+	"members.approve":         "Freigeben",
+	"members.reject":          "Ablehnen",
+	"members.none":            "Keine ausstehenden Freigaben.",
+	"products.empty":          "Noch keine Produkte konfiguriert.",
+	"products.copy":           "Die Produktverwaltung ist in diesem MVP bewusst einfach; Seed-Produkte sind aktiv.",
+	"qr.matrices":             "QR-Matrizen",
+	"qr.matrix":               "QR-Befehlsmatrix",
+	"qr.print_matrix":         "Matrix drucken",
+	"qr.generated":            "Für den laminierten Betriebseinsatz generiert.",
+	"qr.print":                "Drucken",
+	"qr.backup":               "Backup-Ortslink",
+	"qr.backup_copy":          "Öffne die Ortsseite, wenn ein Befehlslabel beschädigt oder unklar ist.",
+	"qr.open_place":           "Ortsseite öffnen",
+	"devqr.matrix":            "Entwicklungs-QR-Matrix",
+	"devqr.title":             "Entwicklungs-QR-Codes",
+	"devqr.copy":              "Klicke auf eine QR-Karte, um einen Scan zu simulieren. Drucke diese Seite, um echte Smartphone-Kamera-Scans zu testen.",
+	"reports.title":           "Bewegungsberichte",
+	"reports.export":          "CSV exportieren",
+	"reports.date_range":      "Datumsbereich",
+	"reports.last_7_days":     "Letzte 7 Tage",
+	"reports.product":         "Produkt",
+	"reports.place":           "Ort",
+	"reports.all_products":    "Alle Produkte",
+	"reports.all_places":      "Alle Orte",
+	"reports.chart":           "Diagramm-Platzhalter · Demnächst",
+	"reports.preview":         "Exportvorschau",
+	"reports.empty":           "Noch keine Berichtsdaten.",
+	"unit.units":              "Einheiten",
+	"result.current":          "Aktueller Bestand hier",
+	"result.undoq":            "Diesen Scan korrigieren?",
+	"result.undocopy":         "Rückgängig erstellt ein Stornoereignis. Der Audit-Trail bleibt erhalten.",
+	"result.viewplaces":       "Orte anzeigen",
+	"result.created":          "Erstellt",
+	"result.warning":          "Warnung:",
+	"result.negative":         "Bestand ist jetzt negativ:",
+	"result.to":               "zu",
+	"result.from":             "von",
+	"result.added":            "HINZUGEFÜGT",
+	"result.subtracted":       "ENTNOMMEN",
+	"result.event":            "EREIGNIS",
+	"result.undo":             "Rückgängig",
+	"result.undo_expired":     "Rückgängig-Zeitfenster abgelaufen",
+	"result.undone":           "Rückgängig gemacht.",
+	"result.undone_copy":      "Ein Stornoereignis wurde erstellt.",
+	"result.scan_copy":        "Scanne den nächsten QR-Code mit deiner Handykamera.",
+	"result.scan_later":       "In-App-Scannen kann später aktiviert werden.",
+}
+
+var englishMessages = map[string]string{
+	"nav.places":              "Places",
+	"nav.events":              "Events",
+	"nav.admin":               "Admin",
+	"nav.settings":            "Settings",
+	"nav.logout":              "Logout",
+	"login.tag":               "Scan. Move. Done.",
+	"login.title":             "Log in",
+	"login.copy":              "Fast inventory for real-world work.",
+	"login.email":             "Email",
+	"login.password":          "Password",
+	"login.submit":            "Log in",
+	"login.register":          "Create an account",
+	"register.tag":            "Join your team",
+	"register.title":          "Create account",
+	"register.name":           "Name",
+	"register.submit":         "Create account",
+	"waiting.eyebrow":         "Waiting for approval",
+	"waiting.title":           "Waiting for approval",
+	"waiting.added":           "Your account has been added to Example Company.",
+	"waiting.copy":            "An admin must approve you before you can change inventory.",
+	"waiting.switch":          "Use another account",
+	"error.eyebrow":           "Zest cannot continue",
+	"error.home":              "Go home",
+	"error.login":             "Log in",
+	"error.waiting":           "Your account is waiting for approval or access was rejected.",
+	"error.invalid_invite":    "Invalid invite.",
+	"error.invalid_qr":        "This QR code is invalid or no longer active.",
+	"error.inactive_qr":       "This QR code refers to an inactive place or product.",
+	"action.add":              "Add",
+	"action.subtract":         "Subtract",
+	"action.add_section":      "ADD",
+	"action.subtract_section": "SUBTRACT",
+	"settings.title":          "Settings",
+	"settings.language":       "Language",
+	"settings.device":         "Device default",
+	"settings.english":        "English",
+	"settings.german":         "German",
+	"settings.save":           "Save settings",
+	"settings.saved":          "Settings saved.",
+	"settings.copy":           "Choose a language or use your device default.",
+	"places.eyebrow":          "Operator places",
+	"places.title":            "Places",
+	"places.copy":             "Open a place, scan a command QR, and keep moving.",
+	"places.devqr":            "Dev QRs",
+	"places.active":           "Active",
+	"places.cardcopy":         "View current stock and recent movement.",
+	"places.empty":            "No active places yet.",
+	"place.eyebrow":           "Active place",
+	"place.stock":             "Current stock by product.",
+	"place.approved":          "Approved",
+	"place.here":              "here",
+	"place.zero":              "Zero stock.",
+	"place.negative":          "Negative stock. Check the last movement.",
+	"place.recent":            "Recent activity",
+	"place.viewall":           "View all",
+	"place.recentempty":       "Recent movement appears after scans.",
+	"place.scannext":          "Scan next",
+	"events.eyebrow":          "Audit timeline",
+	"events.title":            "Recent events",
+	"events.empty":            "No events yet.",
+	"events.added":            "Added",
+	"events.subtracted":       "Subtracted",
+	"events.reversal":         "Reversal of",
+	"admin.backoffice":        "Backoffice",
+	"admin.title":             "Admin dashboard",
+	"admin.approvals":         "Pending approvals",
+	"admin.products":          "Products",
+	"admin.reports":           "Reports",
+	"admin.settings":          "Settings",
+	"admin.total":             "Total stock",
+	"admin.today":             "Events today",
+	"admin.negative":          "Negative stock",
+	"admin.activeplaces":      "Active places",
+	"admin.activeproducts":    "Active products",
+	"admin.reports_settings":  "Reports and settings",
+	"admin.coming_soon":       "Advanced charts, alerts, and configuration are coming soon.",
+	"members.user":            "User",
+	"members.status":          "Status",
+	"members.actions":         "Actions",
+	"members.approve":         "Approve",
+	"members.reject":          "Reject",
+	"members.none":            "No pending approvals.",
+	"products.empty":          "No products configured yet.",
+	"products.copy":           "Product administration is intentionally simple in this MVP; seed products are active.",
+	"qr.matrices":             "QR matrices",
+	"qr.matrix":               "QR command matrix",
+	"qr.print_matrix":         "Print matrix",
+	"qr.generated":            "Generated for laminated operational use.",
+	"qr.print":                "Print",
+	"qr.backup":               "Backup place link",
+	"qr.backup_copy":          "Open the place page if a command label is damaged or unclear.",
+	"qr.open_place":           "Open place page",
+	"devqr.matrix":            "Development QR matrix",
+	"devqr.title":             "Development QR Codes",
+	"devqr.copy":              "Click any QR card to simulate scanning. Print this page to test real phone-camera QR scans.",
+	"reports.title":           "Movement reports",
+	"reports.export":          "Export CSV",
+	"reports.date_range":      "Date range",
+	"reports.last_7_days":     "Last 7 days",
+	"reports.product":         "Product",
+	"reports.place":           "Place",
+	"reports.all_products":    "All products",
+	"reports.all_places":      "All places",
+	"reports.chart":           "Chart placeholder · Coming soon",
+	"reports.preview":         "Event export preview",
+	"reports.empty":           "No report data yet.",
+	"unit.units":              "units",
+	"result.current":          "Current stock here",
+	"result.undoq":            "Need to correct this scan?",
+	"result.undocopy":         "Undo creates a reversal event. The audit trail stays intact.",
+	"result.viewplaces":       "View places",
+	"result.created":          "Created",
+	"result.warning":          "Warning:",
+	"result.negative":         "stock is now negative:",
+	"result.to":               "to",
+	"result.from":             "from",
+	"result.added":            "ADDED",
+	"result.subtracted":       "SUBTRACTED",
+	"result.event":            "EVENT",
+	"result.undo":             "Undo",
+	"result.undo_expired":     "Undo window expired",
+	"result.undone":           "Undone.",
+	"result.undone_copy":      "A reversal event was created.",
+	"result.scan_copy":        "Use your phone camera to scan the next QR code.",
+	"result.scan_later":       "In-app scanning can be enabled later.",
+}
+
+func tr(c Ctx, key string) string {
+	if m, ok := messages[c.Lang]; ok {
+		if v := m[key]; v != "" {
+			return v
+		}
+	}
+	return englishMessages[key]
+}
+
+func actionLabel(c Ctx, action string) string {
+	if action == "add" {
+		return tr(c, "action.add")
+	}
+	if action == "subtract" {
+		return tr(c, "action.subtract")
+	}
+	return action
+}
+
+func unitLabel(c Ctx, u string) string {
+	if u == "units" {
+		return tr(c, "unit.units")
+	}
+	return u
+}
+
+func eventText(c Ctx, typ string, qty int, product, unit string) string {
+	amount := fmt.Sprintf("%d %s %s", abs(qty), unitLabel(c, unit), product)
+	if c.Lang == "de" {
+		switch {
+		case typ == "reversal":
+			return "Storno von " + amount
+		case qty > 0:
+			return amount + " hinzugefügt"
+		default:
+			return amount + " entnommen"
+		}
+	}
+	switch {
+	case typ == "reversal":
+		return "Reversal of " + amount
+	case qty > 0:
+		return "Added " + amount
+	default:
+		return "Subtracted " + amount
+	}
+}
+
+func (a *App) settings(w http.ResponseWriter, r *http.Request) {
+	c, ok := a.need(w, r)
+	if !ok {
+		return
+	}
+	if r.Method == "POST" {
+		if !a.checkPost(w, r, c) {
+			return
+		}
+		lang := r.FormValue("language")
+		if lang != "" && !langSupported(lang) {
+			http.Error(w, "unsupported language", 400)
+			return
+		}
+		a.db.Exec("update users set language=? where id=?", lang, c.UserID)
+		http.Redirect(w, r, "/settings?saved=1", 303)
+		return
+	}
+	a.render(w, r, "settings", map[string]any{"Saved": r.URL.Query().Get("saved") == "1"})
+}
+
 func (a *App) routes(m *http.ServeMux) {
 	m.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/places", 302) })
@@ -251,6 +627,7 @@ func (a *App) routes(m *http.ServeMux) {
 	m.HandleFunc("/places", a.places)
 	m.HandleFunc("/reports/export.csv", a.csv)
 	m.HandleFunc("/reports", a.reports)
+	m.HandleFunc("/settings", a.settings)
 	m.HandleFunc("/admin/", a.adminRoutes)
 	m.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := a.admin(w, r); ok {
@@ -317,7 +694,7 @@ func (a *App) join(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.URL.Path, "/org/join/")
 	var org string
 	if a.db.QueryRow("select organization_id from organization_invites where token=? and active=1", token).Scan(&org) != nil {
-		a.render(w, r, "error", map[string]string{"Message": "Invalid invite."})
+		a.render(w, r, "error", map[string]string{"Message": tr(c, "error.invalid_invite")})
 		return
 	}
 	a.db.Exec("insert or ignore into memberships(id,organization_id,user_id,role,status)values(?,?,?,?,?)", id(), org, c.UserID, "operator", "pending")
@@ -334,7 +711,7 @@ func (a *App) scan(w http.ResponseWriter, r *http.Request) {
 	var amt, pactive, practive, qactive int
 	err := a.db.QueryRow(`select q.id,q.organization_id,q.place_id,q.product_id,q.action,q.amount,q.active,p.active,pr.active,p.name,pr.name from qr_commands q join places p on p.id=q.place_id join products pr on pr.id=q.product_id where q.token=?`, token).Scan(&qid, &org, &pl, &pr, &act, &amt, &qactive, &pactive, &practive, &place, &pn)
 	if err != nil || qactive == 0 {
-		a.render(w, r, "error", map[string]string{"Message": "This QR code is invalid or no longer active."})
+		a.render(w, r, "error", map[string]string{"Message": tr(c, "error.invalid_qr")})
 		return
 	}
 	if org != c.OrgID {
@@ -342,7 +719,7 @@ func (a *App) scan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if pactive == 0 || practive == 0 {
-		a.render(w, r, "error", map[string]string{"Message": "This QR code refers to an inactive place or product."})
+		a.render(w, r, "error", map[string]string{"Message": tr(c, "error.inactive_qr")})
 		return
 	}
 	delta := amt
@@ -510,14 +887,14 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) listEvents(org string) []map[string]any {
-	rows, _ := a.db.Query(`select e.created_at,u.name,e.quantity_delta,pr.name,pl.name,e.event_type from inventory_events e join users u on u.id=e.user_id join products pr on pr.id=e.product_id join places pl on pl.id=e.place_id where e.organization_id=? order by e.created_at desc limit 100`, org)
+	rows, _ := a.db.Query(`select e.created_at,u.name,e.quantity_delta,pr.name,pr.unit,pl.name,e.event_type from inventory_events e join users u on u.id=e.user_id join products pr on pr.id=e.product_id join places pl on pl.id=e.place_id where e.organization_id=? order by e.created_at desc limit 100`, org)
 	defer rows.Close()
 	var out []map[string]any
 	for rows.Next() {
-		var t, u, p, pl, et string
+		var t, u, p, unit, pl, et string
 		var q int
-		rows.Scan(&t, &u, &q, &p, &pl, &et)
-		out = append(out, map[string]any{"Time": t, "User": u, "Qty": q, "Product": p, "Place": pl, "Type": et})
+		rows.Scan(&t, &u, &q, &p, &unit, &pl, &et)
+		out = append(out, map[string]any{"Time": t, "User": u, "Qty": q, "Product": p, "Unit": unit, "Place": pl, "Type": et})
 	}
 	return out
 }
@@ -588,7 +965,7 @@ func (a *App) qrMatrix(w http.ResponseWriter, r *http.Request, c Ctx) {
 		var amt int
 		rows.Scan(&act, &amt, &prod, &tok)
 		scanURL := a.scanURL(tok)
-		out = append(out, map[string]any{"Action": act, "Label": fmt.Sprintf("%s %d %s", strings.Title(act), amt, prod), "Href": scanURL, "Img": a.qrImageURL(scanURL)})
+		out = append(out, map[string]any{"Action": act, "Label": fmt.Sprintf("%s %d %s", actionLabel(c, act), amt, prod), "Href": scanURL, "Img": a.qrImageURL(scanURL)})
 	}
 	a.render(w, r, "qr", out)
 }
@@ -615,7 +992,7 @@ func (a *App) devQRCodes(w http.ResponseWriter, r *http.Request) {
 		rows.Scan(&place, &prod, &act, &amt, &tok)
 		href := "/scan/" + tok
 		scanURL := a.scanURL(tok)
-		out = append(out, map[string]any{"Place": place, "Product": prod, "Action": act, "Amount": amt, "Href": href, "Img": a.qrImageURL(scanURL)})
+		out = append(out, map[string]any{"Place": place, "Product": prod, "Action": act, "ActionLabel": actionLabel(c, act), "Amount": amt, "Href": href, "Img": a.qrImageURL(scanURL)})
 	}
 	a.render(w, r, "devqr", out)
 }
@@ -644,9 +1021,9 @@ func (a *App) csv(w http.ResponseWriter, r *http.Request) {
 
 var _ = context.Background
 
-const tpl = `{{define "layout"}}<!doctype html><html lang="en"><head><title>Zest · {{.Title}}</title><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/app.css"><script src="https://unpkg.com/htmx.org@1.9.12"></script><script src="https://unpkg.com/hyperscript.org@0.9.12"></script></head><body><header class="mobile-header"><div><a class="wordmark" href="/places"><img src="/static/zest-logo.svg" alt="" width="32" height="32">Zest</a><div class="header-meta">Example Company{{if .Ctx.Status}} · {{.Ctx.Status}}{{end}}</div></div><nav class="header-nav" aria-label="Primary"><a class="button ghost icon-button" href="/places" title="Places">⌂</a><a class="button ghost icon-button" href="/events" title="Events">↕</a>{{if eq .Ctx.Role "admin"}}<a class="button ghost icon-button" href="/admin" title="Admin">☰</a>{{end}}{{if .Ctx.Authed}}<form method="post" action="/logout">{{csrf .Ctx}}<button class="ghost icon-button" title="Logout">⎋</button></form>{{end}}</nav></header><main class="app-main">{{template "body" .}}</main></body></html>{{end}}
-{{define "login"}}{{template "layout" .}}{{end}}{{define "body"}}{{if eq .Title "login"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.svg" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">Scan. Move. Done.</p><h1>Log in</h1><p class="muted">Fast inventory for real-world work.</p><form method="post"><input type="hidden" name="return" value="{{.Data}}"><label>Email<input name="email" type="email" autocomplete="email" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button class="primary full">Log in</button></form><p><a href="/register">Create an account</a></p></div></section>{{else}}{{template "body2" .}}{{end}}{{end}}
-{{define "body2"}}{{if eq .Title "register"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.svg" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">Join your team</p><h1>Create account</h1><form method="post"><label>Name<input name="name" autocomplete="name" required></label><label>Email<input name="email" type="email" autocomplete="email" required></label><label>Password<input name="password" type="password" autocomplete="new-password" required></label><button class="primary full">Create account</button></form></div></section>{{else if eq .Title "waiting"}}<section class="card status-info"><p class="eyebrow">Waiting for approval</p><h1>Waiting for approval</h1><p>Your account has been added to Example Company.</p><p>An admin must approve you before you can change inventory.</p><a class="button secondary" href="/logout">Use another account</a></section>{{else if eq .Title "error"}}<section class="card status-danger"><p class="eyebrow">Zest cannot continue</p><h1>{{index .Data "Message"}}</h1><div class="row mt"><a class="button primary" href="/places">Go home</a><a class="button secondary" href="/login">Log in</a></div></section>{{else if eq .Title "places"}}<div class="page-header"><div><p class="eyebrow">Operator places</p><h1>Places</h1><p class="muted">Open a place, scan a command QR, and keep moving.</p></div><a class="button secondary" href="/dev/qr-codes">Dev QRs</a></div><div class="grid">{{range .Data}}<a class="product-card product-default" href="/places/{{.Token}}"><div class="row"><h2>{{.Name}}</h2><span class="pill">Active</span></div><p class="muted">View current stock and recent movement.</p></a>{{else}}<div class="empty-state">No active places yet.</div>{{end}}</div>{{else if eq .Title "place"}}<div class="page-header"><div><p class="eyebrow">Active place</p><h1>{{index .Data "Name"}}</h1><p class="muted">Current stock by product.</p></div><span class="pill">Approved</span></div><div class="grid two">{{range index .Data "Stocks"}}<article class="product-card {{productClass .Name}} {{if lt .Qty 0}}negative{{end}}"><span class="product-badge {{productClass .Name}}">{{.Name}}</span><div class="stock-qty">{{.Qty}}</div><p class="muted">{{.Unit}} here</p>{{if lt .Qty 0}}<p class="status-banner status-warning">Negative stock. Check the last movement.</p>{{else if eq .Qty 0}}<p class="muted">Zero stock.</p>{{end}}</article>{{else}}<div class="empty-state">No products configured yet.</div>{{end}}</div><section class="section-header"><h2>Recent activity</h2><a href="/events">View all</a></section><div class="empty-state">Recent movement appears after scans.</div><div class="bottom-action-bar"><a class="button primary" href="/dev/qr-codes">Scan next</a><a class="button secondary" href="/events">Events</a></div>{{else if eq .Title "events"}}<div class="page-header"><div><p class="eyebrow">Audit timeline</p><h1>Recent events</h1></div></div><div class="stack">{{range .Data}}<article class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}} {{if eq .Type "reversal"}}reversal{{end}}">{{eventSign .Qty .Type}}</div><div><strong>{{if eq .Type "reversal"}}Reversal of {{else if gt .Qty 0}}Added {{else}}Subtracted {{end}}{{abs .Qty}} {{.Product}}</strong><p class="muted">{{.Place}} · {{.User}} · {{.Time}}</p><span class="pill">{{.Type}}</span></div></article>{{else}}<div class="empty-state">No events yet.</div>{{end}}</div>{{else if eq .Title "admin"}}<div class="admin-shell"><nav class="admin-nav"><a href="/admin">Dashboard</a><a href="/admin/memberships">Pending approvals</a><a href="/admin/places">Places</a><a href="/admin/products">Products</a><a href="/dev/qr-codes">QR matrices</a><a href="/admin/events">Events</a><a href="/reports">Reports</a><a aria-disabled="true">Settings · Coming soon</a></nav><section class="admin-content"><p class="eyebrow">Backoffice</p><h1>Admin dashboard</h1><div class="admin-grid"><div class="metric-card"><span>Total stock</span><strong>—</strong></div><div class="metric-card"><span>Events today</span><strong>—</strong></div><div class="metric-card"><span>Pending approvals</span><strong>—</strong></div><div class="metric-card"><span>Negative stock</span><strong>—</strong></div><div class="metric-card"><span>Active places</span><strong>—</strong></div><div class="metric-card"><span>Active products</span><strong>—</strong></div></div><div class="card mt"><h2>Reports and settings</h2><p class="muted">Advanced charts, alerts, and configuration are coming soon.</p></div></section></div>{{else if eq .Title "members"}}<h1>Pending approvals</h1><div class="table-card"><table><thead><tr><th>User</th><th>Status</th><th>Actions</th></tr></thead><tbody>{{range .Data}}<tr><td><strong>{{.Name}}</strong><br><span class="muted">{{.Email}}</span></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/memberships/{{.ID}}/approve">{{csrf $.Ctx}}<button>Approve</button></form><form method="post" action="/admin/memberships/{{.ID}}/reject">{{csrf $.Ctx}}<button class="secondary">Reject</button></form></td></tr>{{else}}<tr><td colspan="3">No pending approvals.</td></tr>{{end}}</tbody></table></div>{{else if eq .Title "products"}}<section class="card"><p class="eyebrow">Products</p><h1>Products</h1><p>Product administration is intentionally simple in this MVP; seed products are active.</p><div class="grid two"><span class="product-badge product-lemon">Lemon</span><span class="product-badge product-lime">Lime</span><span class="product-badge product-orange">Orange</span><span class="product-badge product-grapefruit">Grapefruit</span></div></section>{{else if eq .Title "qr"}}<section class="qr-page"><div class="row"><div><span class="wordmark"><img src="/static/zest-logo.svg" alt="" width="32" height="32">Zest</span><p class="eyebrow">QR command matrix · Example Company</p><h1>Print matrix</h1><p class="muted">Generated for laminated operational use.</p></div><button class="secondary no-print" onclick="window.print()">Print</button></div><div class="qr-section"><h2>ADD</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "add"}}<div class="qr"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>SUBTRACT</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "subtract"}}<div class="qr"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>Backup place link</h2><p class="muted">Open the place page if a command label is damaged or unclear.</p><div class="qr"><img alt="Backup QR placeholder" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHdpZHRoPSc5NicgaGVpZ2h0PSc5Nic+PHJlY3Qgd2lkdGg9Jzk2JyBoZWlnaHQ9Jzk2JyBmaWxsPSd3aGl0ZScvPjxyZWN0IHg9JzgnIHk9JzgnIHdpZHRoPSc4MCcgaGVpZ2h0PSc4MCcgZmlsbD0nbm9uZScgc3Ryb2tlPSdibGFjaycvPjx0ZXh0IHg9JzQ4JyB5PSc1MicgZm9udC1zaXplPScxMCcgdGV4dC1hbmNob3I9J21pZGRsZSc+UGxhY2U8L3RleHQ+PC9zdmc+"><small>Open place page</small></div></div></section>{{else if eq .Title "devqr"}}<section class="qr-page"><div class="row"><div><p class="eyebrow">Development QR matrix</p><h1>Development QR Codes</h1><p class="muted">Click any QR card to simulate scanning. Print this page to test real phone-camera QR scans.</p></div><button class="secondary no-print" onclick="window.print()">Print matrix</button></div><div class="qrgrid printable-matrix">{{range .Data}}<a class="qr {{productClass .Product}}" href="{{.Href}}"><img alt="QR code for {{.Action}} {{.Amount}} {{.Product}} at {{.Place}}" src="{{.Img}}"><small>{{.Place}}<br>{{.Action}} {{.Amount}} {{.Product}}</small></a>{{end}}</div></section>{{else if eq .Title "reports"}}<div class="page-header"><div><p class="eyebrow">Reports</p><h1>Movement reports</h1></div><a class="button primary" href="/reports/export.csv">Export CSV</a></div><section class="card"><div class="report-filters"><label>Date range<input value="Last 7 days" disabled></label><label>Product<select disabled><option>All products</option></select></label><label>Place<select disabled><option>All places</option></select></label></div><div class="chart-placeholder mt">Chart placeholder · Coming soon</div></section><section class="section-header"><h2>Event export preview</h2></section><div class="stack">{{range .Data}}<div class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}}">{{eventSign .Qty .Type}}</div><div><strong>{{.Product}}</strong><p class="muted">{{.Place}} · {{.Time}}</p></div></div>{{else}}<div class="empty-state">No report data yet.</div>{{end}}</div>{{else if eq .Title "result"}}<section class="hero-result {{productClass (index .Data "Product")}}"><span class="result-action">{{if gt (index .Data "Delta") 0}}ADDED{{else if lt (index .Data "Delta") 0}}SUBTRACTED{{else}}EVENT{{end}}</span><div class="result-amount">{{index .Data "Amount"}} ×</div><h1>{{index .Data "Product"}}</h1><p class="result-place">{{if gt (index .Data "Delta") 0}}to{{else}}from{{end}} {{index .Data "Place"}}</p><div class="current-stock"><p class="eyebrow">Current stock here</p><strong class="stock-qty">{{index .Data "Stock"}} {{index .Data "Unit"}}</strong></div><p class="muted mt">Created {{index .Data "Created"}}</p></section>{{if index .Data "Negative"}}<p class="status-banner status-warning mt"><strong>Warning:</strong> stock is now negative: {{index .Data "Stock"}} {{index .Data "Unit"}}.</p>{{end}}<div id="undo" class="undo-panel mt">{{if not (index .Data "Reversed")}}<p><strong>Need to correct this scan?</strong><br><span class="muted">Undo creates a reversal event. The audit trail stays intact.</span></p><form hx-post="/events/{{index .Data "ID"}}/undo" hx-target="#undo" method="post">{{csrf .Ctx}}<button class="danger full" _="on load set n to {{index .Data "UndoSeconds"}} then repeat while n > 0 set my.innerText to 'Undo · ' + n + 's' wait 1s decrement n end then set my.disabled to true then set my.innerText to 'Undo window expired'">Undo · {{index .Data "UndoSeconds"}}s</button></form>{{else}}<div class="success"><strong>Undone.</strong><p>A reversal event was created.</p></div>{{end}}</div><section class="card mt"><h2>Scan next</h2><p>Use your phone camera to scan the next QR code.</p><p class="muted">In-app scanning can be enabled later.</p></section><div class="bottom-action-bar"><a class="button primary" href="/dev/qr-codes">Scan next</a><a class="button secondary" href="/places">View places</a></div>{{end}}{{end}}
+const tpl = `{{define "layout"}}<!doctype html><html lang="{{.Ctx.Lang}}"><head><title>Zest · {{.Title}}</title><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/app.css"><script src="https://unpkg.com/htmx.org@1.9.12"></script><script src="https://unpkg.com/hyperscript.org@0.9.12"></script></head><body><header class="mobile-header"><div><a class="wordmark" href="/places"><img src="/static/zest-logo.svg" alt="" width="32" height="32">Zest</a><div class="header-meta">Example Company{{if .Ctx.Status}} · {{.Ctx.Status}}{{end}}</div></div><nav class="header-nav" aria-label="Primary"><a class="button ghost icon-button" href="/places" title="{{t .Ctx "nav.places"}}">⌂</a><a class="button ghost icon-button" href="/events" title="{{t .Ctx "nav.events"}}">↕</a><a class="button ghost icon-button" href="/settings" title="{{t .Ctx "nav.settings"}}">⚙</a>{{if eq .Ctx.Role "admin"}}<a class="button ghost icon-button" href="/admin" title="{{t .Ctx "nav.admin"}}">☰</a>{{end}}{{if .Ctx.Authed}}<form method="post" action="/logout">{{csrf .Ctx}}<button class="ghost icon-button" title="{{t .Ctx "nav.logout"}}">⎋</button></form>{{end}}</nav></header><main class="app-main">{{template "body" .}}</main></body></html>{{end}}
+{{define "login"}}{{template "layout" .}}{{end}}{{define "body"}}{{if eq .Title "login"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.svg" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">{{t .Ctx "login.tag"}}</p><h1>{{t .Ctx "login.title"}}</h1><p class="muted">{{t .Ctx "login.copy"}}</p><form method="post"><input type="hidden" name="return" value="{{.Data}}"><label>{{t .Ctx "login.email"}}<input name="email" type="email" autocomplete="email" required></label><label>{{t .Ctx "login.password"}}<input name="password" type="password" autocomplete="current-password" required></label><button class="primary full">{{t .Ctx "login.submit"}}</button></form><p><a href="/register">{{t .Ctx "login.register"}}</a></p></div></section>{{else}}{{template "body2" .}}{{end}}{{end}}
+{{define "body2"}}{{if eq .Title "register"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.svg" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">{{t .Ctx "register.tag"}}</p><h1>{{t .Ctx "register.title"}}</h1><form method="post"><label>{{t .Ctx "register.name"}}<input name="name" autocomplete="name" required></label><label>{{t .Ctx "login.email"}}<input name="email" type="email" autocomplete="email" required></label><label>{{t .Ctx "login.password"}}<input name="password" type="password" autocomplete="new-password" required></label><button class="primary full">{{t .Ctx "register.submit"}}</button></form></div></section>{{else if eq .Title "waiting"}}<section class="card status-info"><p class="eyebrow">{{t .Ctx "waiting.eyebrow"}}</p><h1>{{t .Ctx "waiting.title"}}</h1><p>{{t .Ctx "waiting.added"}}</p><p>{{t .Ctx "waiting.copy"}}</p><a class="button secondary" href="/logout">{{t .Ctx "waiting.switch"}}</a></section>{{else if eq .Title "error"}}<section class="card status-danger"><p class="eyebrow">{{t .Ctx "error.eyebrow"}}</p><h1>{{index .Data "Message"}}</h1><div class="row mt"><a class="button primary" href="/places">{{t .Ctx "error.home"}}</a><a class="button secondary" href="/login">{{t .Ctx "error.login"}}</a></div></section>{{else if eq .Title "places"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "places.eyebrow"}}</p><h1>{{t .Ctx "places.title"}}</h1><p class="muted">{{t .Ctx "places.copy"}}</p></div><a class="button secondary" href="/dev/qr-codes">{{t .Ctx "places.devqr"}}</a></div><div class="grid">{{range .Data}}<a class="product-card product-default" href="/places/{{.Token}}"><div class="row"><h2>{{.Name}}</h2><span class="pill">{{t $.Ctx "places.active"}}</span></div><p class="muted">{{t $.Ctx "places.cardcopy"}}</p></a>{{else}}<div class="empty-state">{{t .Ctx "places.empty"}}</div>{{end}}</div>{{else if eq .Title "place"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "place.eyebrow"}}</p><h1>{{index .Data "Name"}}</h1><p class="muted">{{t .Ctx "place.stock"}}</p></div><span class="pill">{{t .Ctx "place.approved"}}</span></div><div class="grid two">{{range index .Data "Stocks"}}<article class="product-card {{productClass .Name}} {{if lt .Qty 0}}negative{{end}}"><span class="product-badge {{productClass .Name}}">{{.Name}}</span><div class="stock-qty">{{.Qty}}</div><p class="muted">{{unit $.Ctx .Unit}} {{t $.Ctx "place.here"}}</p>{{if lt .Qty 0}}<p class="status-banner status-warning">{{t $.Ctx "place.negative"}}</p>{{else if eq .Qty 0}}<p class="muted">{{t $.Ctx "place.zero"}}</p>{{end}}</article>{{else}}<div class="empty-state">{{t .Ctx "products.empty"}}</div>{{end}}</div><section class="section-header"><h2>{{t .Ctx "place.recent"}}</h2><a href="/events">{{t .Ctx "place.viewall"}}</a></section><div class="empty-state">{{t .Ctx "place.recentempty"}}</div><div class="bottom-action-bar"><a class="button primary" href="/dev/qr-codes">{{t .Ctx "place.scannext"}}</a><a class="button secondary" href="/events">{{t .Ctx "nav.events"}}</a></div>{{else if eq .Title "events"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "events.eyebrow"}}</p><h1>{{t .Ctx "events.title"}}</h1></div></div><div class="stack">{{range .Data}}<article class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}} {{if eq .Type "reversal"}}reversal{{end}}">{{eventSign .Qty .Type}}</div><div><strong>{{eventText $.Ctx .Type .Qty .Product .Unit}}</strong><p class="muted">{{.Place}} · {{.User}} · {{.Time}}</p><span class="pill">{{.Type}}</span></div></article>{{else}}<div class="empty-state">{{t .Ctx "events.empty"}}</div>{{end}}</div>{{else if eq .Title "admin"}}<div class="admin-shell"><nav class="admin-nav"><a href="/admin">{{t .Ctx "admin.title"}}</a><a href="/admin/memberships">{{t .Ctx "admin.approvals"}}</a><a href="/admin/places">{{t .Ctx "places.title"}}</a><a href="/admin/products">{{t .Ctx "admin.products"}}</a><a href="/dev/qr-codes">{{t .Ctx "qr.matrices"}}</a><a href="/admin/events">{{t .Ctx "nav.events"}}</a><a href="/reports">{{t .Ctx "admin.reports"}}</a><a href="/settings">{{t .Ctx "admin.settings"}}</a></nav><section class="admin-content"><p class="eyebrow">{{t .Ctx "admin.backoffice"}}</p><h1>{{t .Ctx "admin.title"}}</h1><div class="admin-grid"><div class="metric-card"><span>{{t .Ctx "admin.total"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.today"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.approvals"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.negative"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.activeplaces"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.activeproducts"}}</span><strong>—</strong></div></div><div class="card mt"><h2>{{t .Ctx "admin.reports_settings"}}</h2><p class="muted">{{t .Ctx "admin.coming_soon"}}</p></div></section></div>{{else if eq .Title "members"}}<h1>{{t .Ctx "admin.approvals"}}</h1><div class="table-card"><table><thead><tr><th>{{t .Ctx "members.user"}}</th><th>{{t .Ctx "members.status"}}</th><th>{{t .Ctx "members.actions"}}</th></tr></thead><tbody>{{range .Data}}<tr><td><strong>{{.Name}}</strong><br><span class="muted">{{.Email}}</span></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/memberships/{{.ID}}/approve">{{csrf $.Ctx}}<button>{{t $.Ctx "members.approve"}}</button></form><form method="post" action="/admin/memberships/{{.ID}}/reject">{{csrf $.Ctx}}<button class="secondary">{{t $.Ctx "members.reject"}}</button></form></td></tr>{{else}}<tr><td colspan="3">{{t .Ctx "members.none"}}</td></tr>{{end}}</tbody></table></div>{{else if eq .Title "products"}}<section class="card"><p class="eyebrow">{{t .Ctx "admin.products"}}</p><h1>{{t .Ctx "admin.products"}}</h1><p>{{t .Ctx "products.copy"}}</p><div class="grid two"><span class="product-badge product-lemon">Lemon</span><span class="product-badge product-lime">Lime</span><span class="product-badge product-orange">Orange</span><span class="product-badge product-grapefruit">Grapefruit</span></div></section>{{else if eq .Title "qr"}}<section class="qr-page"><div class="row"><div><span class="wordmark"><img src="/static/zest-logo.svg" alt="" width="32" height="32">Zest</span><p class="eyebrow">{{t .Ctx "qr.matrix"}} · Example Company</p><h1>{{t .Ctx "qr.print_matrix"}}</h1><p class="muted">{{t .Ctx "qr.generated"}}</p></div><button class="secondary no-print" onclick="window.print()">{{t .Ctx "qr.print"}}</button></div><div class="qr-section"><h2>{{t .Ctx "action.add_section"}}</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "add"}}<div class="qr"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>{{t .Ctx "action.subtract_section"}}</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "subtract"}}<div class="qr"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>{{t .Ctx "qr.backup"}}</h2><p class="muted">{{t .Ctx "qr.backup_copy"}}</p><div class="qr"><img alt="Backup QR placeholder" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHdpZHRoPSc5NicgaGVpZ2h0PSc5Nic+PHJlY3Qgd2lkdGg9Jzk2JyBoZWlnaHQ9Jzk2JyBmaWxsPSd3aGl0ZScvPjxyZWN0IHg9JzgnIHk9JzgnIHdpZHRoPSc4MCcgaGVpZ2h0PSc4MCcgZmlsbD0nbm9uZScgc3Ryb2tlPSdibGFjaycvPjx0ZXh0IHg9JzQ4JyB5PSc1MicgZm9udC1zaXplPScxMCcgdGV4dC1hbmNob3I9J21pZGRsZSc+UGxhY2U8L3RleHQ+PC9zdmc+"><small>{{t .Ctx "qr.open_place"}}</small></div></div></section>{{else if eq .Title "devqr"}}<section class="qr-page"><div class="row"><div><p class="eyebrow">{{t .Ctx "devqr.matrix"}}</p><h1>{{t .Ctx "devqr.title"}}</h1><p class="muted">{{t .Ctx "devqr.copy"}}</p></div><button class="secondary no-print" onclick="window.print()">{{t .Ctx "qr.print_matrix"}}</button></div><div class="qrgrid printable-matrix">{{range .Data}}<a class="qr {{productClass .Product}}" href="{{.Href}}"><img alt="QR code for {{.ActionLabel}} {{.Amount}} {{.Product}} at {{.Place}}" src="{{.Img}}"><small>{{.Place}}<br>{{.ActionLabel}} {{.Amount}} {{.Product}}</small></a>{{end}}</div></section>{{else if eq .Title "settings"}}<section class="card"><p class="eyebrow">{{t .Ctx "nav.settings"}}</p><h1>{{t .Ctx "settings.title"}}</h1><p class="muted">{{t .Ctx "settings.copy"}}</p>{{if index .Data "Saved"}}<p class="status-banner status-success">{{t .Ctx "settings.saved"}}</p>{{end}}<form method="post" class="mt">{{csrf .Ctx}}<label>{{t .Ctx "settings.language"}}<select name="language"><option value="" {{if eq .Ctx.LangPref ""}}selected{{end}}>{{t .Ctx "settings.device"}}</option><option value="en" {{if eq .Ctx.LangPref "en"}}selected{{end}}>{{t .Ctx "settings.english"}}</option><option value="de" {{if eq .Ctx.LangPref "de"}}selected{{end}}>{{t .Ctx "settings.german"}}</option></select></label><button class="primary">{{t .Ctx "settings.save"}}</button></form></section>{{else if eq .Title "reports"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "admin.reports"}}</p><h1>{{t .Ctx "reports.title"}}</h1></div><a class="button primary" href="/reports/export.csv">{{t .Ctx "reports.export"}}</a></div><section class="card"><div class="report-filters"><label>{{t .Ctx "reports.date_range"}}<input value="{{t .Ctx "reports.last_7_days"}}" disabled></label><label>{{t .Ctx "reports.product"}}<select disabled><option>{{t .Ctx "reports.all_products"}}</option></select></label><label>{{t .Ctx "reports.place"}}<select disabled><option>{{t .Ctx "reports.all_places"}}</option></select></label></div><div class="chart-placeholder mt">{{t .Ctx "reports.chart"}}</div></section><section class="section-header"><h2>{{t .Ctx "reports.preview"}}</h2></section><div class="stack">{{range .Data}}<div class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}}">{{eventSign .Qty .Type}}</div><div><strong>{{eventText $.Ctx .Type .Qty .Product .Unit}}</strong><p class="muted">{{.Place}} · {{.Time}}</p></div></div>{{else}}<div class="empty-state">{{t .Ctx "reports.empty"}}</div>{{end}}</div>{{else if eq .Title "result"}}<section class="hero-result {{productClass (index .Data "Product")}}"><span class="result-action">{{if gt (index .Data "Delta") 0}}{{t .Ctx "result.added"}}{{else if lt (index .Data "Delta") 0}}{{t .Ctx "result.subtracted"}}{{else}}{{t .Ctx "result.event"}}{{end}}</span><div class="result-amount">{{index .Data "Amount"}} ×</div><h1>{{index .Data "Product"}}</h1><p class="result-place">{{if gt (index .Data "Delta") 0}}{{t .Ctx "result.to"}}{{else}}{{t .Ctx "result.from"}}{{end}} {{index .Data "Place"}}</p><div class="current-stock"><p class="eyebrow">{{t .Ctx "result.current"}}</p><strong class="stock-qty">{{index .Data "Stock"}} {{unit .Ctx (index .Data "Unit")}}</strong></div><p class="muted mt">{{t .Ctx "result.created"}} {{index .Data "Created"}}</p></section>{{if index .Data "Negative"}}<p class="status-banner status-warning mt"><strong>{{t .Ctx "result.warning"}}</strong> {{t .Ctx "result.negative"}} {{index .Data "Stock"}} {{unit .Ctx (index .Data "Unit")}}.</p>{{end}}<div id="undo" class="undo-panel mt">{{if not (index .Data "Reversed")}}<p><strong>{{t .Ctx "result.undoq"}}</strong><br><span class="muted">{{t .Ctx "result.undocopy"}}</span></p><form hx-post="/events/{{index .Data "ID"}}/undo" hx-target="#undo" method="post">{{csrf .Ctx}}<button class="danger full" _="on load set n to {{index .Data "UndoSeconds"}} then repeat while n > 0 set my.innerText to '{{t .Ctx "result.undo"}} · ' + n + 's' wait 1s decrement n end then set my.disabled to true then set my.innerText to '{{t .Ctx "result.undo_expired"}}'">{{t .Ctx "result.undo"}} · {{index .Data "UndoSeconds"}}s</button></form>{{else}}<div class="success"><strong>{{t .Ctx "result.undone"}}</strong><p>{{t .Ctx "result.undone_copy"}}</p></div>{{end}}</div><section class="card mt"><h2>{{t .Ctx "place.scannext"}}</h2><p>{{t .Ctx "result.scan_copy"}}</p><p class="muted">{{t .Ctx "result.scan_later"}}</p></section><div class="bottom-action-bar"><a class="button primary" href="/dev/qr-codes">{{t .Ctx "place.scannext"}}</a><a class="button secondary" href="/places">{{t .Ctx "result.viewplaces"}}</a></div>{{end}}{{end}}
 {{define "register"}}{{template "layout" .}}{{end}}
 {{define "waiting"}}{{template "layout" .}}{{end}}
 {{define "error"}}{{template "layout" .}}{{end}}
@@ -658,6 +1035,7 @@ const tpl = `{{define "layout"}}<!doctype html><html lang="en"><head><title>Zest
 {{define "products"}}{{template "layout" .}}{{end}}
 {{define "qr"}}{{template "layout" .}}{{end}}
 {{define "devqr"}}{{template "layout" .}}{{end}}
+{{define "settings"}}{{template "layout" .}}{{end}}
 {{define "reports"}}{{template "layout" .}}{{end}}
 {{define "result"}}{{template "layout" .}}{{end}}
 `
