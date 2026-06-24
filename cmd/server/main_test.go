@@ -173,3 +173,16 @@ func TestSettingsPersistsLanguagePreference(t *testing.T) {
 		t.Fatalf("language=%q, want de", lang)
 	}
 }
+
+func TestGermanHelpersTranslateUnitsAndEventText(t *testing.T) {
+	ctx := Ctx{Lang: "de"}
+	if got := unitLabel(ctx, "units"); got != "Einheiten" {
+		t.Fatalf("unitLabel=%q, want Einheiten", got)
+	}
+	if got := eventText(ctx, "add", 10, "Lemon", "units"); got != "10 Einheiten Lemon hinzugefügt" {
+		t.Fatalf("eventText add=%q", got)
+	}
+	if got := eventText(ctx, "subtract", -5, "Lime", "units"); got != "5 Einheiten Lime entnommen" {
+		t.Fatalf("eventText subtract=%q", got)
+	}
+}
