@@ -41,7 +41,6 @@ h1,h2,h3,p{margin-block-start:0}h1{font-size:clamp(2rem,8vw,4rem);line-height:.9
   .app-main.admin-area>.stack{grid-template-columns:repeat(auto-fill,minmax(360px,1fr));align-items:start}
   .app-main.admin-area h1{font-size:clamp(2.4rem,5vw,4.8rem)}
   .admin-shell{width:100%;max-width:1240px;grid-template-columns:260px minmax(0,1fr);gap:var(--space-6);padding:0}
-  .admin-shell::before{content:"";position:fixed;inset:0 auto 0 0;width:320px;background:linear-gradient(180deg,#fff,var(--zest-50));border-right:var(--border);z-index:-1}
   .admin-nav{top:calc(70px + var(--space-5));gap:.45rem;padding:var(--space-4);border:var(--border);border-radius:var(--radius-xl);background:rgba(255,255,255,.78);box-shadow:var(--shadow-md);backdrop-filter:blur(18px)}
   .admin-nav a{display:flex;align-items:center;min-height:3rem;border-color:transparent;background:transparent;color:var(--ink-700);box-shadow:none}
   .admin-nav a:hover,.admin-nav a:focus-visible{background:var(--ice-50);border-color:color-mix(in srgb,var(--ink-300),white 55%);color:var(--ink-900)}
