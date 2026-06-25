@@ -475,11 +475,11 @@ func TestAdminPlacesPageUsesCollapsedListManagement(t *testing.T) {
 	if !strings.Contains(body, `class="new-product-menu"`) || !strings.Contains(body, `<summary class="button primary">Add place</summary>`) {
 		t.Fatalf("places page should hide the new-place form behind an Add place button: %s", body)
 	}
-	if !strings.Contains(body, `class="product-list" role="list"`) || !strings.Contains(body, `class="product-list-item `) {
-		t.Fatalf("places page should render places as clickable list entries: %s", body)
+	if !strings.Contains(body, `class="admin-place-grid" role="list"`) || !strings.Contains(body, `class="place-card admin-place-card `) {
+		t.Fatalf("places page should render places as place-card style entries: %s", body)
 	}
-	if strings.Contains(body, `<table`) {
-		t.Fatalf("places page should not render the management UI as a table: %s", body)
+	if strings.Contains(body, `<table`) || strings.Contains(body, `Token:`) {
+		t.Fatalf("places page should not render a table or expose place tokens: %s", body)
 	}
 }
 
@@ -620,7 +620,10 @@ func TestAdminPlacesWarnsButAllowsArchiveWithStock(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	body := rec.Body.String()
 	if !strings.Contains(body, "This place contains current stock") || !strings.Contains(body, "Archive anyway?") {
-		t.Fatalf("places page should warn and confirm before archiving stocked places: %s", body)
+		t.Fatalf("places page should confirm before archiving stocked places: %s", body)
+	}
+	if strings.Contains(body, `status-warning`) {
+		t.Fatalf("places page should only show the stock warning in the archive prompt: %s", body)
 	}
 
 	var csrf string
