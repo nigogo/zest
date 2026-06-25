@@ -277,4 +277,18 @@ func TestAdminCanSetProductColorAcrossProductMentions(t *testing.T) {
 			t.Fatalf("%s missing saved product color: %s", path, rec.Body.String())
 		}
 	}
+
+	req = httptest.NewRequest(http.MethodGet, "/events", nil)
+	for _, cookie := range loginRec.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if strings.Contains(body, `class="event-card product-`) || strings.Contains(body, `<article class="event-card" style=`) {
+		t.Fatalf("event card should keep the neutral card style and not carry product coloring: %s", body)
+	}
+	if !strings.Contains(body, `class="event-product-line"`) || !strings.Contains(body, `class="product-badge product-lemon" style="--product:#1234AB`) {
+		t.Fatalf("event product name should be wrapped in a colored product badge: %s", body)
+	}
 }
