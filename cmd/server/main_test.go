@@ -185,6 +185,9 @@ func TestGermanHelpersTranslateUnitsAndEventText(t *testing.T) {
 	if got := eventText(ctx, "subtract", -5, "Lime", "units"); got != "5 Einheiten Lime entnommen" {
 		t.Fatalf("eventText subtract=%q", got)
 	}
+	if got := eventAmountText(ctx, "add", 10, "units"); got != "10 Einheiten hinzugefügt" {
+		t.Fatalf("eventAmountText add=%q", got)
+	}
 }
 
 func TestPlacesPageShowsStockOverviewInsteadOfActiveLabel(t *testing.T) {
@@ -290,5 +293,8 @@ func TestAdminCanSetProductColorAcrossProductMentions(t *testing.T) {
 	}
 	if !strings.Contains(body, `class="event-product-line"`) || !strings.Contains(body, `class="product-badge product-lemon" style="--product:#1234AB`) {
 		t.Fatalf("event product name should be wrapped in a colored product badge: %s", body)
+	}
+	if !strings.Contains(body, `<p class="event-amount-line">Added 10 units</p>`) {
+		t.Fatalf("event amount should be shown on its own second line: %s", body)
 	}
 }
