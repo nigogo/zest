@@ -213,6 +213,9 @@ func TestPlacesPageShowsStockOverviewInsteadOfActiveLabel(t *testing.T) {
 	if strings.Contains(body, `class="pill">Active`) {
 		t.Fatalf("places page still shows active label: %s", body)
 	}
+	if strings.Contains(body, `class="product-card product-default"`) || !strings.Contains(body, `class="place-card"`) {
+		t.Fatalf("places page should use distinct place cards: %s", body)
+	}
 	if !strings.Contains(body, "40 units Lemon") || !strings.Contains(body, "20 units Lime") {
 		t.Fatalf("places page missing stock overview: %s", body)
 	}
