@@ -478,8 +478,11 @@ func TestAdminPlacesPageUsesCollapsedListManagement(t *testing.T) {
 	if !strings.Contains(body, `class="product-list" role="list"`) || !strings.Contains(body, `class="product-list-item `) {
 		t.Fatalf("places page should render places as product-style list entries: %s", body)
 	}
-	if strings.Contains(body, `<table`) || strings.Contains(body, `Token:`) {
-		t.Fatalf("places page should not render a table or expose place tokens: %s", body)
+	if !strings.Contains(body, `class="admin-place-list-name"`) || !strings.Contains(body, `class="place-icon small"`) {
+		t.Fatalf("places page should show compact place icons before names: %s", body)
+	}
+	if strings.Contains(body, `<table`) || strings.Contains(body, `Token:`) || strings.Contains(body, `product-badge product-default`) {
+		t.Fatalf("places page should not render a table, expose tokens, or use product badge labels: %s", body)
 	}
 }
 
