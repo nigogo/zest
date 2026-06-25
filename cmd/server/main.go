@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -88,6 +89,7 @@ func (a *App) migrate() {
 	must(err)
 	a.ensureColumn("users", "language", "TEXT NOT NULL DEFAULT ''")
 	a.ensureColumn("users", "time_format", "TEXT NOT NULL DEFAULT 'local'")
+	a.ensureColumn("products", "color", "TEXT NOT NULL DEFAULT ''")
 }
 
 func (a *App) ensureColumn(table, column, definition string) {
@@ -118,6 +120,7 @@ func (a *App) seed() {
 	a.db.QueryRow("select count(*) from organizations").Scan(&c)
 	org := "org_dev"
 	if c > 0 {
+		a.backfillProductColors(org)
 		a.ensureSeedApprovedUser(org)
 		a.ensureSeedQRCommands(org)
 		return
@@ -135,9 +138,27 @@ func (a *App) seed() {
 		a.db.Exec("insert into places(id,organization_id,name,token,active)values(?,?,?,?,1)", fmt.Sprintf("place_%d", i), org, p, "place-"+id())
 	}
 	for i, p := range prods {
-		a.db.Exec("insert into products(id,organization_id,name,code,unit,active)values(?,?,?,?,?,1)", fmt.Sprintf("prod_%d", i), org, p, fmt.Sprintf("P%d", i+1), "units")
+		a.db.Exec("insert into products(id,organization_id,name,code,unit,color,active)values(?,?,?,?,?,?,1)", fmt.Sprintf("prod_%d", i), org, p, fmt.Sprintf("P%d", i+1), "units", defaultProductColor(p))
 	}
+	a.backfillProductColors(org)
 	a.ensureSeedQRCommands(org)
+}
+
+func (a *App) backfillProductColors(org string) {
+	rows, err := a.db.Query("select id,name from products where organization_id=? and coalesce(color,'')=''", org)
+	if err != nil {
+		log.Printf("product color query failed: %v", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var productID, name string
+		if err := rows.Scan(&productID, &name); err != nil {
+			log.Printf("product color scan failed: %v", err)
+			continue
+		}
+		a.db.Exec("update products set color=? where id=? and organization_id=?", defaultProductColor(name), productID, org)
+	}
 }
 
 func (a *App) ensureSeedApprovedUser(org string) {
@@ -192,7 +213,7 @@ func (a *App) ids(query string, arg string) []string {
 }
 
 func (a *App) templates() {
-	a.tmpl = template.Must(template.New("base").Funcs(template.FuncMap{"productClass": productClass, "eventSign": eventSign, "eventText": eventText, "unit": unitLabel, "t": tr, "abs": func(n int) int {
+	a.tmpl = template.Must(template.New("base").Funcs(template.FuncMap{"productClass": productClass, "productStyle": productStyle, "eventSign": eventSign, "eventText": eventText, "eventAmountText": eventAmountText, "unit": unitLabel, "t": tr, "abs": func(n int) int {
 		if n < 0 {
 			return -n
 		}
@@ -378,7 +399,7 @@ var germanMessages = map[string]string{
 	"members.reject":          "Ablehnen",
 	"members.none":            "Keine ausstehenden Freigaben.",
 	"products.empty":          "Noch keine Produkte konfiguriert.",
-	"products.copy":           "Die Produktverwaltung ist in diesem MVP bewusst einfach; Seed-Produkte sind aktiv.",
+	"products.copy":           "Lege pro Produkt eine Organisationsfarbe fest. Diese Farbe erscheint in allen Produktansichten.",
 	"qr.matrices":             "QR-Matrizen",
 	"qr.matrix":               "QR-Befehlsmatrix",
 	"qr.print_matrix":         "Matrix drucken",
@@ -512,7 +533,7 @@ var englishMessages = map[string]string{
 	"members.reject":          "Reject",
 	"members.none":            "No pending approvals.",
 	"products.empty":          "No products configured yet.",
-	"products.copy":           "Product administration is intentionally simple in this MVP; seed products are active.",
+	"products.copy":           "Set an organization-wide color for each product. That color appears everywhere the product is shown.",
 	"qr.matrices":             "QR matrices",
 	"qr.matrix":               "QR command matrix",
 	"qr.print_matrix":         "Print matrix",
@@ -656,6 +677,26 @@ func eventText(c Ctx, typ string, qty int, product, unit string) string {
 	default:
 		return "Subtracted " + amount
 	}
+}
+
+func eventAmountText(c Ctx, typ string, qty int, unit string) string {
+	amount := fmt.Sprintf("%d %s", abs(qty), unitLabel(c, unit))
+	if c.Lang == "de" {
+		if typ == "reversal" {
+			return "Storno von " + amount
+		}
+		if qty > 0 {
+			return amount + " hinzugefügt"
+		}
+		return amount + " entnommen"
+	}
+	if typ == "reversal" {
+		return "Reversal of " + amount
+	}
+	if qty > 0 {
+		return "Added " + amount
+	}
+	return "Subtracted " + amount
 }
 
 func (a *App) settings(w http.ResponseWriter, r *http.Request) {
@@ -837,13 +878,13 @@ func (a *App) result(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) eventData(eid, org string) map[string]any {
-	var place, prod, unit, etype, uid, created string
+	var place, prod, unit, color, etype, uid, created string
 	var delta, stock, rev int
-	err := a.db.QueryRow(`select pl.name,pr.name,pr.unit,e.event_type,e.user_id,e.created_at,e.quantity_delta,(select coalesce(sum(quantity_delta),0) from inventory_events where place_id=e.place_id and product_id=e.product_id),(select count(*) from inventory_events where reversed_event_id=e.id) from inventory_events e join places pl on pl.id=e.place_id join products pr on pr.id=e.product_id where e.id=? and e.organization_id=?`, eid, org).Scan(&place, &prod, &unit, &etype, &uid, &created, &delta, &stock, &rev)
+	err := a.db.QueryRow(`select pl.name,pr.name,pr.unit,coalesce(pr.color,''),e.event_type,e.user_id,e.created_at,e.quantity_delta,(select coalesce(sum(quantity_delta),0) from inventory_events where place_id=e.place_id and product_id=e.product_id),(select count(*) from inventory_events where reversed_event_id=e.id) from inventory_events e join places pl on pl.id=e.place_id join products pr on pr.id=e.product_id where e.id=? and e.organization_id=?`, eid, org).Scan(&place, &prod, &unit, &color, &etype, &uid, &created, &delta, &stock, &rev)
 	if err != nil {
 		return nil
 	}
-	return map[string]any{"ID": eid, "Place": place, "Product": prod, "Unit": unit, "Type": etype, "Delta": delta, "Amount": abs(delta), "Stock": stock, "Reversed": rev > 0, "UndoSeconds": int(a.undoWindow.Seconds()), "Created": created, "Negative": stock < 0}
+	return map[string]any{"ID": eid, "Place": place, "Product": prod, "Unit": unit, "Color": color, "Type": etype, "Delta": delta, "Amount": abs(delta), "Stock": stock, "Reversed": rev > 0, "UndoSeconds": int(a.undoWindow.Seconds()), "Created": created, "Negative": stock < 0}
 }
 
 func productClass(name string) string {
@@ -860,6 +901,43 @@ func productClass(name string) string {
 	default:
 		return "product-default"
 	}
+}
+
+var productColorPattern = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)
+
+func defaultProductColor(name string) string {
+	n := strings.ToLower(name)
+	switch {
+	case strings.Contains(n, "lemon"):
+		return "#f4c430"
+	case strings.Contains(n, "lime"):
+		return "#75b843"
+	case strings.Contains(n, "orange"):
+		return "#f28c28"
+	case strings.Contains(n, "grapefruit"):
+		return "#e85d75"
+	default:
+		return "#f5b700"
+	}
+}
+
+func normalizeProductColor(color string) string {
+	color = strings.TrimSpace(color)
+	if color == "" {
+		return ""
+	}
+	if productColorPattern.MatchString(color) {
+		return strings.ToUpper(color)
+	}
+	return ""
+}
+
+func productStyle(color string) template.CSS {
+	color = normalizeProductColor(color)
+	if color == "" {
+		return ""
+	}
+	return template.CSS("--product:" + color + ";--product-soft:color-mix(in srgb," + color + ",white 84%)")
 }
 
 func eventSign(q int, typ string) string {
@@ -931,7 +1009,7 @@ func (a *App) places(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) placeStockOverview(c Ctx, placeID string) []map[string]any {
-	rows, err := a.db.Query(`select p.name,p.unit,coalesce(sum(e.quantity_delta),0) as stock from products p left join inventory_events e on e.product_id=p.id and e.place_id=? where p.organization_id=? and p.active=1 group by p.id order by stock desc,p.name limit 3`, placeID, c.OrgID)
+	rows, err := a.db.Query(`select p.name,p.unit,coalesce(p.color,''),coalesce(sum(e.quantity_delta),0) as stock from products p left join inventory_events e on e.product_id=p.id and e.place_id=? where p.organization_id=? and p.active=1 group by p.id order by stock desc,p.name limit 3`, placeID, c.OrgID)
 	if err != nil {
 		return nil
 	}
@@ -939,10 +1017,10 @@ func (a *App) placeStockOverview(c Ctx, placeID string) []map[string]any {
 
 	var overview []map[string]any
 	for rows.Next() {
-		var name, unit string
+		var name, unit, color string
 		var qty int
-		rows.Scan(&name, &unit, &qty)
-		overview = append(overview, map[string]any{"Name": name, "Unit": unitLabel(c, unit), "Qty": qty})
+		rows.Scan(&name, &unit, &color, &qty)
+		overview = append(overview, map[string]any{"Name": name, "Unit": unitLabel(c, unit), "Qty": qty, "Color": color})
 	}
 	return overview
 }
@@ -958,13 +1036,13 @@ func (a *App) placeToken(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	rows, _ := a.db.Query(`select p.name,p.unit,coalesce(sum(e.quantity_delta),0) from products p left join inventory_events e on e.product_id=p.id and e.place_id=? where p.organization_id=? and p.active=1 group by p.id order by p.name`, pid, c.OrgID)
+	rows, _ := a.db.Query(`select p.name,p.unit,coalesce(p.color,''),coalesce(sum(e.quantity_delta),0) from products p left join inventory_events e on e.product_id=p.id and e.place_id=? where p.organization_id=? and p.active=1 group by p.id order by p.name`, pid, c.OrgID)
 	var stocks []map[string]any
 	for rows.Next() {
-		var n, u string
+		var n, u, color string
 		var q int
-		rows.Scan(&n, &u, &q)
-		stocks = append(stocks, map[string]any{"Name": n, "Unit": u, "Qty": q})
+		rows.Scan(&n, &u, &color, &q)
+		stocks = append(stocks, map[string]any{"Name": n, "Unit": u, "Qty": q, "Color": color})
 	}
 	rows.Close()
 	a.render(w, r, "place", map[string]any{"Name": name, "Stocks": stocks})
@@ -979,14 +1057,14 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) listEvents(org string) []map[string]any {
-	rows, _ := a.db.Query(`select e.created_at,u.name,e.quantity_delta,pr.name,pr.unit,pl.name,e.event_type from inventory_events e join users u on u.id=e.user_id join products pr on pr.id=e.product_id join places pl on pl.id=e.place_id where e.organization_id=? order by e.created_at desc limit 100`, org)
+	rows, _ := a.db.Query(`select e.created_at,u.name,e.quantity_delta,pr.name,pr.unit,coalesce(pr.color,''),pl.name,e.event_type from inventory_events e join users u on u.id=e.user_id join products pr on pr.id=e.product_id join places pl on pl.id=e.place_id where e.organization_id=? order by e.created_at desc limit 100`, org)
 	defer rows.Close()
 	var out []map[string]any
 	for rows.Next() {
-		var t, u, p, unit, pl, et string
+		var t, u, p, unit, color, pl, et string
 		var q int
-		rows.Scan(&t, &u, &q, &p, &unit, &pl, &et)
-		out = append(out, map[string]any{"Time": t, "User": u, "Qty": q, "Product": p, "Unit": unit, "Place": pl, "Type": et})
+		rows.Scan(&t, &u, &q, &p, &unit, &color, &pl, &et)
+		out = append(out, map[string]any{"Time": t, "User": u, "Qty": q, "Product": p, "Unit": unit, "Color": color, "Place": pl, "Type": et})
 	}
 	return out
 }
@@ -1026,7 +1104,29 @@ func (a *App) adminRoutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if p == "/admin/products" {
-		a.render(w, r, "products", nil)
+		if r.Method == "POST" {
+			productID := r.FormValue("product_id")
+			color := normalizeProductColor(r.FormValue("color"))
+			if color == "" {
+				http.Error(w, "color must be a hex color like #F4C430", 400)
+				return
+			}
+			a.db.Exec("update products set color=? where id=? and organization_id=?", color, productID, c.OrgID)
+			http.Redirect(w, r, "/admin/products", 303)
+			return
+		}
+		rows, _ := a.db.Query("select id,name,code,unit,coalesce(color,'') from products where organization_id=? order by name", c.OrgID)
+		defer rows.Close()
+		var out []map[string]string
+		for rows.Next() {
+			var id, name, code, unit, color string
+			rows.Scan(&id, &name, &code, &unit, &color)
+			if color == "" {
+				color = defaultProductColor(name)
+			}
+			out = append(out, map[string]string{"ID": id, "Name": name, "Code": code, "Unit": unit, "Color": color})
+		}
+		a.render(w, r, "products", out)
 		return
 	}
 	if strings.HasSuffix(p, "/qr-matrix") {
@@ -1050,14 +1150,14 @@ func (a *App) scanURL(token string) string {
 
 func (a *App) qrMatrix(w http.ResponseWriter, r *http.Request, c Ctx) {
 	pid := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/admin/places/"), "/qr-matrix")
-	rows, _ := a.db.Query(`select q.action,q.amount,pr.name,q.token from qr_commands q join products pr on pr.id=q.product_id where q.organization_id=? and q.place_id=? and q.active=1 and pr.active=1 order by q.action,pr.name,q.amount`, c.OrgID, pid)
+	rows, _ := a.db.Query(`select q.action,q.amount,pr.name,coalesce(pr.color,''),q.token from qr_commands q join products pr on pr.id=q.product_id where q.organization_id=? and q.place_id=? and q.active=1 and pr.active=1 order by q.action,pr.name,q.amount`, c.OrgID, pid)
 	var out []map[string]any
 	for rows.Next() {
-		var act, prod, tok string
+		var act, prod, color, tok string
 		var amt int
-		rows.Scan(&act, &amt, &prod, &tok)
+		rows.Scan(&act, &amt, &prod, &color, &tok)
 		scanURL := a.scanURL(tok)
-		out = append(out, map[string]any{"Action": act, "Label": fmt.Sprintf("%s %d %s", actionLabel(c, act), amt, prod), "Href": scanURL, "Img": a.qrImageURL(scanURL)})
+		out = append(out, map[string]any{"Action": act, "Label": fmt.Sprintf("%s %d %s", actionLabel(c, act), amt, prod), "Href": scanURL, "Img": a.qrImageURL(scanURL), "Color": color})
 	}
 	a.render(w, r, "qr", out)
 }
@@ -1071,7 +1171,7 @@ func (a *App) devQRCodes(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := a.db.Query(`select pl.name,pr.name,q.action,q.amount,q.token from qr_commands q join places pl on pl.id=q.place_id join products pr on pr.id=q.product_id where q.organization_id=? and q.active=1 and pl.active=1 and pr.active=1 order by pl.name,pr.name,q.action,q.amount`, c.OrgID)
+	rows, err := a.db.Query(`select pl.name,pr.name,coalesce(pr.color,''),q.action,q.amount,q.token from qr_commands q join places pl on pl.id=q.place_id join products pr on pr.id=q.product_id where q.organization_id=? and q.active=1 and pl.active=1 and pr.active=1 order by pl.name,pr.name,q.action,q.amount`, c.OrgID)
 	if err != nil {
 		http.Error(w, "could not load QR commands", 500)
 		return
@@ -1079,12 +1179,12 @@ func (a *App) devQRCodes(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	var out []map[string]any
 	for rows.Next() {
-		var place, prod, act, tok string
+		var place, prod, color, act, tok string
 		var amt int
-		rows.Scan(&place, &prod, &act, &amt, &tok)
+		rows.Scan(&place, &prod, &color, &act, &amt, &tok)
 		href := "/scan/" + tok
 		scanURL := a.scanURL(tok)
-		out = append(out, map[string]any{"Place": place, "Product": prod, "Action": act, "ActionLabel": actionLabel(c, act), "Amount": amt, "Href": href, "Img": a.qrImageURL(scanURL)})
+		out = append(out, map[string]any{"Place": place, "Product": prod, "Color": color, "Action": act, "ActionLabel": actionLabel(c, act), "Amount": amt, "Href": href, "Img": a.qrImageURL(scanURL)})
 	}
 	a.render(w, r, "devqr", out)
 }
@@ -1115,7 +1215,7 @@ var _ = context.Background
 
 const tpl = `{{define "layout"}}<!doctype html><html lang="{{.Ctx.Lang}}"><head><title>Zest · {{.Title}}</title><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/app.css"><script src="https://unpkg.com/htmx.org@1.9.12"></script><script src="https://unpkg.com/hyperscript.org@0.9.12"></script><script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script></head><body><header class="mobile-header"><div><a class="wordmark" href="/places"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</a></div><nav class="header-nav" aria-label="Primary"><a class="button ghost icon-button" href="/places" title="{{t .Ctx "nav.places"}}"><i data-lucide="package" aria-hidden="true"></i></a><a class="button ghost icon-button" href="/events" title="{{t .Ctx "nav.events"}}"><i data-lucide="clipboard-list" aria-hidden="true"></i></a><a class="button ghost icon-button" href="/settings" title="{{t .Ctx "nav.settings"}}"><i data-lucide="settings" aria-hidden="true"></i></a>{{if eq .Ctx.Role "admin"}}<a class="button ghost icon-button" href="/admin" title="{{t .Ctx "nav.admin"}}"><i data-lucide="shield" aria-hidden="true"></i></a>{{end}}{{if .Ctx.Authed}}<form method="post" action="/logout">{{csrf .Ctx}}<button class="ghost icon-button" title="{{t .Ctx "nav.logout"}}"><i data-lucide="log-out" aria-hidden="true"></i></button></form>{{end}}</nav></header><main class="app-main">{{template "body" .}}</main><script>window.lucide&&lucide.createIcons()</script></body></html>{{end}}
 {{define "login"}}{{template "layout" .}}{{end}}{{define "body"}}{{if eq .Title "login"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">{{t .Ctx "login.tag"}}</p><h1>{{t .Ctx "login.title"}}</h1><p class="muted">{{t .Ctx "login.copy"}}</p><form method="post"><input type="hidden" name="return" value="{{.Data}}"><label>{{t .Ctx "login.email"}}<input name="email" type="email" autocomplete="email" required></label><label>{{t .Ctx "login.password"}}<input name="password" type="password" autocomplete="current-password" required></label><button class="primary full">{{t .Ctx "login.submit"}}</button></form><p><a href="/register">{{t .Ctx "login.register"}}</a></p></div></section>{{else}}{{template "body2" .}}{{end}}{{end}}
-{{define "body2"}}{{if eq .Title "register"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">{{t .Ctx "register.tag"}}</p><h1>{{t .Ctx "register.title"}}</h1><form method="post"><label>{{t .Ctx "register.name"}}<input name="name" autocomplete="name" required></label><label>{{t .Ctx "login.email"}}<input name="email" type="email" autocomplete="email" required></label><label>{{t .Ctx "login.password"}}<input name="password" type="password" autocomplete="new-password" required></label><button class="primary full">{{t .Ctx "register.submit"}}</button></form></div></section>{{else if eq .Title "waiting"}}<section class="card status-info"><p class="eyebrow">{{t .Ctx "waiting.eyebrow"}}</p><h1>{{t .Ctx "waiting.title"}}</h1><p>{{t .Ctx "waiting.added"}}</p><p>{{t .Ctx "waiting.copy"}}</p><a class="button secondary" href="/logout">{{t .Ctx "waiting.switch"}}</a></section>{{else if eq .Title "error"}}<section class="card status-danger"><p class="eyebrow">{{t .Ctx "error.eyebrow"}}</p><h1>{{index .Data "Message"}}</h1><div class="row mt"><a class="button primary" href="/places">{{t .Ctx "error.home"}}</a><a class="button secondary" href="/login">{{t .Ctx "error.login"}}</a></div></section>{{else if eq .Title "places"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "places.eyebrow"}}</p><h1>{{t .Ctx "places.title"}}</h1><p class="muted">{{t .Ctx "places.copy"}}</p></div><a class="button secondary" href="/dev/qr-codes">{{t .Ctx "places.devqr"}}</a></div><div class="grid">{{range .Data}}<a class="place-card" href="/places/{{.Token}}"><div class="place-card-header"><span class="place-icon" aria-hidden="true"><i data-lucide="package"></i></span><h2>{{.Name}}</h2></div><dl class="place-overview">{{range .Overview}}<div class="place-overview-item {{productClass .Name}}"><dt>{{.Name}}</dt><dd><strong>{{.Qty}}</strong> {{.Unit}}</dd></div>{{else}}<div class="place-overview-empty">{{t $.Ctx "places.cardcopy"}}</div>{{end}}</dl></a>{{else}}<div class="empty-state">{{t .Ctx "places.empty"}}</div>{{end}}</div>{{else if eq .Title "place"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "place.eyebrow"}}</p><h1>{{index .Data "Name"}}</h1><p class="muted">{{t .Ctx "place.stock"}}</p></div>{{if eq .Ctx.Role "admin"}}<span class="pill">{{t .Ctx "place.approved"}}</span>{{end}}</div><div class="grid two">{{range index .Data "Stocks"}}<article class="product-card {{productClass .Name}} {{if lt .Qty 0}}negative{{end}}"><span class="product-badge {{productClass .Name}}">{{.Name}}</span><div class="stock-qty">{{.Qty}}</div><p class="muted">{{unit $.Ctx .Unit}} {{t $.Ctx "place.here"}}</p>{{if lt .Qty 0}}<p class="status-banner status-warning">{{t $.Ctx "place.negative"}}</p>{{else if eq .Qty 0}}<p class="muted">{{t $.Ctx "place.zero"}}</p>{{end}}</article>{{else}}<div class="empty-state">{{t .Ctx "products.empty"}}</div>{{end}}</div><section class="section-header"><h2>{{t .Ctx "place.recent"}}</h2><a href="/events">{{t .Ctx "place.viewall"}}</a></section><div class="empty-state">{{t .Ctx "place.recentempty"}}</div><div class="bottom-action-bar"><a class="button primary" href="/dev/qr-codes">{{t .Ctx "place.scannext"}}</a><a class="button secondary" href="/events">{{t .Ctx "nav.events"}}</a></div>{{else if eq .Title "events"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "events.eyebrow"}}</p><h1>{{t .Ctx "events.title"}}</h1></div></div><div class="stack">{{range .Data}}<article class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}} {{if eq .Type "reversal"}}reversal{{end}}">{{eventSign .Qty .Type}}</div><div><strong>{{eventText $.Ctx .Type .Qty .Product .Unit}}</strong><p class="muted event-meta"><span>{{.Place}} · {{.User}}</span><span class="event-time">{{formatTime $.Ctx .Time}}</span></p><span class="pill">{{.Type}}</span></div></article>{{else}}<div class="empty-state">{{t .Ctx "events.empty"}}</div>{{end}}</div>{{else if eq .Title "admin"}}<div class="admin-shell"><nav class="admin-nav"><a href="/admin">{{t .Ctx "admin.title"}}</a><a href="/admin/memberships">{{t .Ctx "admin.approvals"}}</a><a href="/admin/places">{{t .Ctx "places.title"}}</a><a href="/admin/products">{{t .Ctx "admin.products"}}</a><a href="/dev/qr-codes">{{t .Ctx "qr.matrices"}}</a><a href="/admin/events">{{t .Ctx "nav.events"}}</a><a href="/reports">{{t .Ctx "admin.reports"}}</a><a href="/settings">{{t .Ctx "admin.settings"}}</a></nav><section class="admin-content"><p class="eyebrow">{{t .Ctx "admin.backoffice"}}</p><h1>{{t .Ctx "admin.title"}}</h1><div class="admin-grid"><div class="metric-card"><span>{{t .Ctx "admin.total"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.today"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.approvals"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.negative"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.activeplaces"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.activeproducts"}}</span><strong>—</strong></div></div><div class="card mt"><h2>{{t .Ctx "admin.reports_settings"}}</h2><p class="muted">{{t .Ctx "admin.coming_soon"}}</p></div></section></div>{{else if eq .Title "members"}}<h1>{{t .Ctx "admin.approvals"}}</h1><div class="table-card"><table><thead><tr><th>{{t .Ctx "members.user"}}</th><th>{{t .Ctx "members.status"}}</th><th>{{t .Ctx "members.actions"}}</th></tr></thead><tbody>{{range .Data}}<tr><td><strong>{{.Name}}</strong><br><span class="muted">{{.Email}}</span></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/memberships/{{.ID}}/approve">{{csrf $.Ctx}}<button>{{t $.Ctx "members.approve"}}</button></form><form method="post" action="/admin/memberships/{{.ID}}/reject">{{csrf $.Ctx}}<button class="secondary">{{t $.Ctx "members.reject"}}</button></form></td></tr>{{else}}<tr><td colspan="3">{{t .Ctx "members.none"}}</td></tr>{{end}}</tbody></table></div>{{else if eq .Title "products"}}<section class="card"><p class="eyebrow">{{t .Ctx "admin.products"}}</p><h1>{{t .Ctx "admin.products"}}</h1><p>{{t .Ctx "products.copy"}}</p><div class="grid two"><span class="product-badge product-lemon">Lemon</span><span class="product-badge product-lime">Lime</span><span class="product-badge product-orange">Orange</span><span class="product-badge product-grapefruit">Grapefruit</span></div></section>{{else if eq .Title "qr"}}<section class="qr-page"><div class="row"><div><span class="wordmark"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</span><p class="eyebrow">{{t .Ctx "qr.matrix"}} · Example Company</p><h1>{{t .Ctx "qr.print_matrix"}}</h1><p class="muted">{{t .Ctx "qr.generated"}}</p></div><button class="secondary no-print" onclick="window.print()">{{t .Ctx "qr.print"}}</button></div><div class="qr-section"><h2>{{t .Ctx "action.add_section"}}</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "add"}}<div class="qr"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>{{t .Ctx "action.subtract_section"}}</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "subtract"}}<div class="qr"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>{{t .Ctx "qr.backup"}}</h2><p class="muted">{{t .Ctx "qr.backup_copy"}}</p><div class="qr"><img alt="Backup QR placeholder" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHdpZHRoPSc5NicgaGVpZ2h0PSc5Nic+PHJlY3Qgd2lkdGg9Jzk2JyBoZWlnaHQ9Jzk2JyBmaWxsPSd3aGl0ZScvPjxyZWN0IHg9JzgnIHk9JzgnIHdpZHRoPSc4MCcgaGVpZ2h0PSc4MCcgZmlsbD0nbm9uZScgc3Ryb2tlPSdibGFjaycvPjx0ZXh0IHg9JzQ4JyB5PSc1MicgZm9udC1zaXplPScxMCcgdGV4dC1hbmNob3I9J21pZGRsZSc+UGxhY2U8L3RleHQ+PC9zdmc+"><small>{{t .Ctx "qr.open_place"}}</small></div></div></section>{{else if eq .Title "devqr"}}<section class="qr-page"><div class="row"><div><p class="eyebrow">{{t .Ctx "devqr.matrix"}}</p><h1>{{t .Ctx "devqr.title"}}</h1><p class="muted">{{t .Ctx "devqr.copy"}}</p></div><button class="secondary no-print" onclick="window.print()">{{t .Ctx "qr.print_matrix"}}</button></div><div class="qrgrid printable-matrix">{{range .Data}}<a class="qr {{productClass .Product}}" href="{{.Href}}"><img alt="QR code for {{.ActionLabel}} {{.Amount}} {{.Product}} at {{.Place}}" src="{{.Img}}"><small>{{.Place}}<br>{{.ActionLabel}} {{.Amount}} {{.Product}}</small></a>{{end}}</div></section>{{else if eq .Title "settings"}}<section class="card"><p class="eyebrow">{{t .Ctx "nav.settings"}}</p><h1>{{t .Ctx "settings.title"}}</h1><p class="muted">{{t .Ctx "settings.copy"}}</p>{{if index .Data "Saved"}}<p class="status-banner status-success">{{t .Ctx "settings.saved"}}</p>{{end}}<form method="post" class="mt">{{csrf .Ctx}}<label>{{t .Ctx "settings.language"}}<select name="language"><option value="" {{if eq .Ctx.LangPref ""}}selected{{end}}>{{t .Ctx "settings.device"}}</option><option value="en" {{if eq .Ctx.LangPref "en"}}selected{{end}}>{{t .Ctx "settings.english"}}</option><option value="de" {{if eq .Ctx.LangPref "de"}}selected{{end}}>{{t .Ctx "settings.german"}}</option></select></label><label>{{t .Ctx "settings.time_format"}}<select name="time_format"><option value="local" {{if eq .Ctx.TimeFormat "local"}}selected{{end}}>{{timeExample .Ctx "local"}}</option><option value="iso" {{if eq .Ctx.TimeFormat "iso"}}selected{{end}}>{{timeExample .Ctx "iso"}}</option><option value="us" {{if eq .Ctx.TimeFormat "us"}}selected{{end}}>{{timeExample .Ctx "us"}}</option><option value="eu" {{if eq .Ctx.TimeFormat "eu"}}selected{{end}}>{{timeExample .Ctx "eu"}}</option><option value="24h" {{if eq .Ctx.TimeFormat "24h"}}selected{{end}}>{{timeExample .Ctx "24h"}}</option></select></label><button class="primary">{{t .Ctx "settings.save"}}</button></form></section>{{else if eq .Title "reports"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "admin.reports"}}</p><h1>{{t .Ctx "reports.title"}}</h1></div><a class="button primary" href="/reports/export.csv">{{t .Ctx "reports.export"}}</a></div><section class="card"><div class="report-filters"><label>{{t .Ctx "reports.date_range"}}<input value="{{t .Ctx "reports.last_7_days"}}" disabled></label><label>{{t .Ctx "reports.product"}}<select disabled><option>{{t .Ctx "reports.all_products"}}</option></select></label><label>{{t .Ctx "reports.place"}}<select disabled><option>{{t .Ctx "reports.all_places"}}</option></select></label></div><div class="chart-placeholder mt">{{t .Ctx "reports.chart"}}</div></section><section class="section-header"><h2>{{t .Ctx "reports.preview"}}</h2></section><div class="stack">{{range .Data}}<div class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}}">{{eventSign .Qty .Type}}</div><div><strong>{{eventText $.Ctx .Type .Qty .Product .Unit}}</strong><p class="muted event-meta"><span>{{.Place}}</span><span class="event-time">{{formatTime $.Ctx .Time}}</span></p></div></div>{{else}}<div class="empty-state">{{t .Ctx "reports.empty"}}</div>{{end}}</div>{{else if eq .Title "result"}}<section class="hero-result {{productClass (index .Data "Product")}}"><span class="result-action">{{if gt (index .Data "Delta") 0}}{{t .Ctx "result.added"}}{{else if lt (index .Data "Delta") 0}}{{t .Ctx "result.subtracted"}}{{else}}{{t .Ctx "result.event"}}{{end}}</span><div class="result-amount">{{index .Data "Amount"}} ×</div><h1>{{index .Data "Product"}}</h1><p class="result-place">{{if gt (index .Data "Delta") 0}}{{t .Ctx "result.to"}}{{else}}{{t .Ctx "result.from"}}{{end}} {{index .Data "Place"}}</p><div class="current-stock"><p class="eyebrow">{{t .Ctx "result.current"}}</p><strong class="stock-qty">{{index .Data "Stock"}} {{unit .Ctx (index .Data "Unit")}}</strong></div><p class="muted mt">{{t .Ctx "result.created"}} {{formatTime .Ctx (index .Data "Created")}}</p></section>{{if index .Data "Negative"}}<p class="status-banner status-warning mt"><strong>{{t .Ctx "result.warning"}}</strong> {{t .Ctx "result.negative"}} {{index .Data "Stock"}} {{unit .Ctx (index .Data "Unit")}}.</p>{{end}}<div id="undo" class="undo-panel mt">{{if not (index .Data "Reversed")}}<p><strong>{{t .Ctx "result.undoq"}}</strong><br><span class="muted">{{t .Ctx "result.undocopy"}}</span></p><form hx-post="/events/{{index .Data "ID"}}/undo" hx-target="#undo" method="post">{{csrf .Ctx}}<button class="danger full" _="on load set n to {{index .Data "UndoSeconds"}} then repeat while n > 0 set my.innerText to '{{t .Ctx "result.undo"}} · ' + n + 's' wait 1s decrement n end then set my.disabled to true then set my.innerText to '{{t .Ctx "result.undo_expired"}}'">{{t .Ctx "result.undo"}} · {{index .Data "UndoSeconds"}}s</button></form>{{else}}<div class="success"><strong>{{t .Ctx "result.undone"}}</strong><p>{{t .Ctx "result.undone_copy"}}</p></div>{{end}}</div><section class="card mt"><h2>{{t .Ctx "place.scannext"}}</h2><p>{{t .Ctx "result.scan_copy"}}</p><p class="muted">{{t .Ctx "result.scan_later"}}</p></section><div class="bottom-action-bar"><a class="button primary" href="/dev/qr-codes">{{t .Ctx "place.scannext"}}</a><a class="button secondary" href="/places">{{t .Ctx "result.viewplaces"}}</a></div>{{end}}{{end}}
+{{define "body2"}}{{if eq .Title "register"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">{{t .Ctx "register.tag"}}</p><h1>{{t .Ctx "register.title"}}</h1><form method="post"><label>{{t .Ctx "register.name"}}<input name="name" autocomplete="name" required></label><label>{{t .Ctx "login.email"}}<input name="email" type="email" autocomplete="email" required></label><label>{{t .Ctx "login.password"}}<input name="password" type="password" autocomplete="new-password" required></label><button class="primary full">{{t .Ctx "register.submit"}}</button></form></div></section>{{else if eq .Title "waiting"}}<section class="card status-info"><p class="eyebrow">{{t .Ctx "waiting.eyebrow"}}</p><h1>{{t .Ctx "waiting.title"}}</h1><p>{{t .Ctx "waiting.added"}}</p><p>{{t .Ctx "waiting.copy"}}</p><a class="button secondary" href="/logout">{{t .Ctx "waiting.switch"}}</a></section>{{else if eq .Title "error"}}<section class="card status-danger"><p class="eyebrow">{{t .Ctx "error.eyebrow"}}</p><h1>{{index .Data "Message"}}</h1><div class="row mt"><a class="button primary" href="/places">{{t .Ctx "error.home"}}</a><a class="button secondary" href="/login">{{t .Ctx "error.login"}}</a></div></section>{{else if eq .Title "places"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "places.eyebrow"}}</p><h1>{{t .Ctx "places.title"}}</h1><p class="muted">{{t .Ctx "places.copy"}}</p></div><a class="button secondary" href="/dev/qr-codes">{{t .Ctx "places.devqr"}}</a></div><div class="grid">{{range .Data}}<a class="place-card" href="/places/{{.Token}}"><div class="place-card-header"><span class="place-icon" aria-hidden="true"><i data-lucide="package"></i></span><h2>{{.Name}}</h2></div><dl class="place-overview">{{range .Overview}}<div class="place-overview-item {{productClass .Name}}" style="{{productStyle .Color}}"><dt>{{.Name}}</dt><dd><strong>{{.Qty}}</strong> {{.Unit}}</dd></div>{{else}}<div class="place-overview-empty">{{t $.Ctx "places.cardcopy"}}</div>{{end}}</dl></a>{{else}}<div class="empty-state">{{t .Ctx "places.empty"}}</div>{{end}}</div>{{else if eq .Title "place"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "place.eyebrow"}}</p><h1>{{index .Data "Name"}}</h1><p class="muted">{{t .Ctx "place.stock"}}</p></div>{{if eq .Ctx.Role "admin"}}<span class="pill">{{t .Ctx "place.approved"}}</span>{{end}}</div><div class="grid two">{{range index .Data "Stocks"}}<article class="product-card {{productClass .Name}} {{if lt .Qty 0}}negative{{end}}" style="{{productStyle .Color}}"><span class="product-badge {{productClass .Name}}" style="{{productStyle .Color}}">{{.Name}}</span><div class="stock-qty">{{.Qty}}</div><p class="muted">{{unit $.Ctx .Unit}} {{t $.Ctx "place.here"}}</p>{{if lt .Qty 0}}<p class="status-banner status-warning">{{t $.Ctx "place.negative"}}</p>{{else if eq .Qty 0}}<p class="muted">{{t $.Ctx "place.zero"}}</p>{{end}}</article>{{else}}<div class="empty-state">{{t .Ctx "products.empty"}}</div>{{end}}</div><section class="section-header"><h2>{{t .Ctx "place.recent"}}</h2><a href="/events">{{t .Ctx "place.viewall"}}</a></section><div class="empty-state">{{t .Ctx "place.recentempty"}}</div><div class="bottom-action-bar"><a class="button primary" href="/dev/qr-codes">{{t .Ctx "place.scannext"}}</a><a class="button secondary" href="/events">{{t .Ctx "nav.events"}}</a></div>{{else if eq .Title "events"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "events.eyebrow"}}</p><h1>{{t .Ctx "events.title"}}</h1></div></div><div class="stack">{{range .Data}}<article class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}} {{if eq .Type "reversal"}}reversal{{end}}">{{eventSign .Qty .Type}}</div><div><strong class="event-product-line"><span class="product-badge {{productClass .Product}}" style="{{productStyle .Color}}">{{.Product}}</span></strong><p class="event-amount-line">{{eventAmountText $.Ctx .Type .Qty .Unit}}</p><p class="muted event-meta"><span>{{.Place}} · {{.User}}</span><span class="event-time">{{formatTime $.Ctx .Time}}</span></p><span class="pill">{{.Type}}</span></div></article>{{else}}<div class="empty-state">{{t .Ctx "events.empty"}}</div>{{end}}</div>{{else if eq .Title "admin"}}<div class="admin-shell"><nav class="admin-nav"><a href="/admin">{{t .Ctx "admin.title"}}</a><a href="/admin/memberships">{{t .Ctx "admin.approvals"}}</a><a href="/admin/places">{{t .Ctx "places.title"}}</a><a href="/admin/products">{{t .Ctx "admin.products"}}</a><a href="/dev/qr-codes">{{t .Ctx "qr.matrices"}}</a><a href="/admin/events">{{t .Ctx "nav.events"}}</a><a href="/reports">{{t .Ctx "admin.reports"}}</a><a href="/settings">{{t .Ctx "admin.settings"}}</a></nav><section class="admin-content"><p class="eyebrow">{{t .Ctx "admin.backoffice"}}</p><h1>{{t .Ctx "admin.title"}}</h1><div class="admin-grid"><div class="metric-card"><span>{{t .Ctx "admin.total"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.today"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.approvals"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.negative"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.activeplaces"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.activeproducts"}}</span><strong>—</strong></div></div><div class="card mt"><h2>{{t .Ctx "admin.reports_settings"}}</h2><p class="muted">{{t .Ctx "admin.coming_soon"}}</p></div></section></div>{{else if eq .Title "members"}}<h1>{{t .Ctx "admin.approvals"}}</h1><div class="table-card"><table><thead><tr><th>{{t .Ctx "members.user"}}</th><th>{{t .Ctx "members.status"}}</th><th>{{t .Ctx "members.actions"}}</th></tr></thead><tbody>{{range .Data}}<tr><td><strong>{{.Name}}</strong><br><span class="muted">{{.Email}}</span></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/memberships/{{.ID}}/approve">{{csrf $.Ctx}}<button>{{t $.Ctx "members.approve"}}</button></form><form method="post" action="/admin/memberships/{{.ID}}/reject">{{csrf $.Ctx}}<button class="secondary">{{t $.Ctx "members.reject"}}</button></form></td></tr>{{else}}<tr><td colspan="3">{{t .Ctx "members.none"}}</td></tr>{{end}}</tbody></table></div>{{else if eq .Title "products"}}<section class="card"><p class="eyebrow">{{t .Ctx "admin.products"}}</p><h1>{{t .Ctx "admin.products"}}</h1><p>{{t .Ctx "products.copy"}}</p><div class="stack mt">{{range .Data}}<form class="product-color-row" method="post" action="/admin/products" style="{{productStyle .Color}}">{{csrf $.Ctx}}<input type="hidden" name="product_id" value="{{.ID}}"><span class="product-badge {{productClass .Name}}" style="{{productStyle .Color}}">{{.Name}}</span><span class="muted">{{.Code}} · {{.Unit}}</span><label class="color-field"><span class="sr-only">Color for {{.Name}}</span><input type="color" name="color" value="{{.Color}}"></label><button class="secondary">Save color</button></form>{{else}}<div class="empty-state">{{t .Ctx "products.empty"}}</div>{{end}}</div></section>{{else if eq .Title "qr"}}<section class="qr-page"><div class="row"><div><span class="wordmark"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</span><p class="eyebrow">{{t .Ctx "qr.matrix"}} · Example Company</p><h1>{{t .Ctx "qr.print_matrix"}}</h1><p class="muted">{{t .Ctx "qr.generated"}}</p></div><button class="secondary no-print" onclick="window.print()">{{t .Ctx "qr.print"}}</button></div><div class="qr-section"><h2>{{t .Ctx "action.add_section"}}</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "add"}}<div class="qr {{productClass .Label}}" style="{{productStyle .Color}}"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>{{t .Ctx "action.subtract_section"}}</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "subtract"}}<div class="qr {{productClass .Label}}" style="{{productStyle .Color}}"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>{{t .Ctx "qr.backup"}}</h2><p class="muted">{{t .Ctx "qr.backup_copy"}}</p><div class="qr"><img alt="Backup QR placeholder" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnIHdpZHRoPSc5NicgaGVpZ2h0PSc5Nic+PHJlY3Qgd2lkdGg9Jzk2JyBoZWlnaHQ9Jzk2JyBmaWxsPSd3aGl0ZScvPjxyZWN0IHg9JzgnIHk9JzgnIHdpZHRoPSc4MCcgaGVpZ2h0PSc4MCcgZmlsbD0nbm9uZScgc3Ryb2tlPSdibGFjaycvPjx0ZXh0IHg9JzQ4JyB5PSc1MicgZm9udC1zaXplPScxMCcgdGV4dC1hbmNob3I9J21pZGRsZSc+UGxhY2U8L3RleHQ+PC9zdmc+"><small>{{t .Ctx "qr.open_place"}}</small></div></div></section>{{else if eq .Title "devqr"}}<section class="qr-page"><div class="row"><div><p class="eyebrow">{{t .Ctx "devqr.matrix"}}</p><h1>{{t .Ctx "devqr.title"}}</h1><p class="muted">{{t .Ctx "devqr.copy"}}</p></div><button class="secondary no-print" onclick="window.print()">{{t .Ctx "qr.print_matrix"}}</button></div><div class="qrgrid printable-matrix">{{range .Data}}<a class="qr {{productClass .Product}}" style="{{productStyle .Color}}" href="{{.Href}}"><img alt="QR code for {{.ActionLabel}} {{.Amount}} {{.Product}} at {{.Place}}" src="{{.Img}}"><small>{{.Place}}<br>{{.ActionLabel}} {{.Amount}} {{.Product}}</small></a>{{end}}</div></section>{{else if eq .Title "settings"}}<section class="card"><p class="eyebrow">{{t .Ctx "nav.settings"}}</p><h1>{{t .Ctx "settings.title"}}</h1><p class="muted">{{t .Ctx "settings.copy"}}</p>{{if index .Data "Saved"}}<p class="status-banner status-success">{{t .Ctx "settings.saved"}}</p>{{end}}<form method="post" class="mt">{{csrf .Ctx}}<label>{{t .Ctx "settings.language"}}<select name="language"><option value="" {{if eq .Ctx.LangPref ""}}selected{{end}}>{{t .Ctx "settings.device"}}</option><option value="en" {{if eq .Ctx.LangPref "en"}}selected{{end}}>{{t .Ctx "settings.english"}}</option><option value="de" {{if eq .Ctx.LangPref "de"}}selected{{end}}>{{t .Ctx "settings.german"}}</option></select></label><label>{{t .Ctx "settings.time_format"}}<select name="time_format"><option value="local" {{if eq .Ctx.TimeFormat "local"}}selected{{end}}>{{timeExample .Ctx "local"}}</option><option value="iso" {{if eq .Ctx.TimeFormat "iso"}}selected{{end}}>{{timeExample .Ctx "iso"}}</option><option value="us" {{if eq .Ctx.TimeFormat "us"}}selected{{end}}>{{timeExample .Ctx "us"}}</option><option value="eu" {{if eq .Ctx.TimeFormat "eu"}}selected{{end}}>{{timeExample .Ctx "eu"}}</option><option value="24h" {{if eq .Ctx.TimeFormat "24h"}}selected{{end}}>{{timeExample .Ctx "24h"}}</option></select></label><button class="primary">{{t .Ctx "settings.save"}}</button></form></section>{{else if eq .Title "reports"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "admin.reports"}}</p><h1>{{t .Ctx "reports.title"}}</h1></div><a class="button primary" href="/reports/export.csv">{{t .Ctx "reports.export"}}</a></div><section class="card"><div class="report-filters"><label>{{t .Ctx "reports.date_range"}}<input value="{{t .Ctx "reports.last_7_days"}}" disabled></label><label>{{t .Ctx "reports.product"}}<select disabled><option>{{t .Ctx "reports.all_products"}}</option></select></label><label>{{t .Ctx "reports.place"}}<select disabled><option>{{t .Ctx "reports.all_places"}}</option></select></label></div><div class="chart-placeholder mt">{{t .Ctx "reports.chart"}}</div></section><section class="section-header"><h2>{{t .Ctx "reports.preview"}}</h2></section><div class="stack">{{range .Data}}<div class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}}">{{eventSign .Qty .Type}}</div><div><strong class="event-product-line"><span class="product-badge {{productClass .Product}}" style="{{productStyle .Color}}">{{.Product}}</span></strong><p class="event-amount-line">{{eventAmountText $.Ctx .Type .Qty .Unit}}</p><p class="muted event-meta"><span>{{.Place}}</span><span class="event-time">{{formatTime $.Ctx .Time}}</span></p></div></div>{{else}}<div class="empty-state">{{t .Ctx "reports.empty"}}</div>{{end}}</div>{{else if eq .Title "result"}}<section class="hero-result {{productClass (index .Data "Product")}}" style="{{productStyle (index .Data "Color")}}"><span class="result-action">{{if gt (index .Data "Delta") 0}}{{t .Ctx "result.added"}}{{else if lt (index .Data "Delta") 0}}{{t .Ctx "result.subtracted"}}{{else}}{{t .Ctx "result.event"}}{{end}}</span><div class="result-amount">{{index .Data "Amount"}} ×</div><h1>{{index .Data "Product"}}</h1><p class="result-place">{{if gt (index .Data "Delta") 0}}{{t .Ctx "result.to"}}{{else}}{{t .Ctx "result.from"}}{{end}} {{index .Data "Place"}}</p><div class="current-stock"><p class="eyebrow">{{t .Ctx "result.current"}}</p><strong class="stock-qty">{{index .Data "Stock"}} {{unit .Ctx (index .Data "Unit")}}</strong></div><p class="muted mt">{{t .Ctx "result.created"}} {{formatTime .Ctx (index .Data "Created")}}</p></section>{{if index .Data "Negative"}}<p class="status-banner status-warning mt"><strong>{{t .Ctx "result.warning"}}</strong> {{t .Ctx "result.negative"}} {{index .Data "Stock"}} {{unit .Ctx (index .Data "Unit")}}.</p>{{end}}<div id="undo" class="undo-panel mt">{{if not (index .Data "Reversed")}}<p><strong>{{t .Ctx "result.undoq"}}</strong><br><span class="muted">{{t .Ctx "result.undocopy"}}</span></p><form hx-post="/events/{{index .Data "ID"}}/undo" hx-target="#undo" method="post">{{csrf .Ctx}}<button class="danger full" _="on load set n to {{index .Data "UndoSeconds"}} then repeat while n > 0 set my.innerText to '{{t .Ctx "result.undo"}} · ' + n + 's' wait 1s decrement n end then set my.disabled to true then set my.innerText to '{{t .Ctx "result.undo_expired"}}'">{{t .Ctx "result.undo"}} · {{index .Data "UndoSeconds"}}s</button></form>{{else}}<div class="success"><strong>{{t .Ctx "result.undone"}}</strong><p>{{t .Ctx "result.undone_copy"}}</p></div>{{end}}</div><section class="card mt"><h2>{{t .Ctx "place.scannext"}}</h2><p>{{t .Ctx "result.scan_copy"}}</p><p class="muted">{{t .Ctx "result.scan_later"}}</p></section><div class="bottom-action-bar"><a class="button primary" href="/dev/qr-codes">{{t .Ctx "place.scannext"}}</a><a class="button secondary" href="/places">{{t .Ctx "result.viewplaces"}}</a></div>{{end}}{{end}}
 {{define "register"}}{{template "layout" .}}{{end}}
 {{define "waiting"}}{{template "layout" .}}{{end}}
 {{define "error"}}{{template "layout" .}}{{end}}
