@@ -223,3 +223,58 @@ func TestPlacesPageShowsStockOverviewInsteadOfActiveLabel(t *testing.T) {
 		t.Fatalf("places page missing second stock overview item: %s", body)
 	}
 }
+
+func TestAdminCanSetProductColorAcrossProductMentions(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRec := httptest.NewRecorder()
+	mux.ServeHTTP(loginRec, login)
+	if loginRec.Code != http.StatusFound {
+		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
+	}
+
+	var csrf string
+	if err := a.db.QueryRow("select csrf from sessions where user_id='user_admin'").Scan(&csrf); err != nil {
+		t.Fatal(err)
+	}
+	form := "csrf=" + csrf + "&product_id=prod_0&color=%231234AB"
+	req := httptest.NewRequest(http.MethodPost, "/admin/products", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range loginRec.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("product color status=%d, want %d; body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+
+	var color string
+	if err := a.db.QueryRow("select color from products where id='prod_0'").Scan(&color); err != nil {
+		t.Fatal(err)
+	}
+	if color != "#1234AB" {
+		t.Fatalf("color=%q, want #1234AB", color)
+	}
+
+	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('color1','org_dev','place_0','prod_0','user_admin',10,'add')")
+	for _, path := range []string{"/admin/products", "/places", "/events", "/events/color1/result"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		for _, cookie := range loginRec.Result().Cookies() {
+			req.AddCookie(cookie)
+		}
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status=%d, want %d; body=%s", path, rec.Code, http.StatusOK, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "--product:#1234AB") {
+			t.Fatalf("%s missing saved product color: %s", path, rec.Body.String())
+		}
+	}
+}
