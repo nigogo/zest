@@ -50,7 +50,7 @@ h1,h2,h3,p{margin-block-start:0}h1{font-size:clamp(2rem,8vw,4rem);line-height:.9
   .metric-card{min-height:150px;display:flex;flex-direction:column;justify-content:space-between;border-radius:26px;background:linear-gradient(145deg,#fff,var(--ice-50));transition:transform .18s ease,box-shadow .18s ease}
   .metric-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg)}
   .metric-card span{font-weight:850;color:var(--ink-500)}
-  .table-card{border-radius:26px}.table-card table{min-width:760px}.table-card th{position:sticky;top:0;background:#fff;z-index:1}.table-card td{vertical-align:middle}
+  .table-card{border-radius:26px}.table-card table{min-width:760px}.table-card th{position:sticky;top:0;background:#fff;z-index:1}.table-card td{vertical-align:middle}.table-card td form{display:inline-flex;margin:0 var(--space-2) 0 0}.table-card td form:last-child{margin-right:0}
   .product-list{gap:var(--space-4)}
   .product-list-item{border-radius:24px}.product-list-item>summary{grid-template-columns:minmax(220px,1fr) 160px 120px auto;padding:var(--space-5)}
   .product-editor{padding:var(--space-5);grid-template-columns:minmax(0,1fr) auto;align-items:end}.product-editor form{margin-top:0}
