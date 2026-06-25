@@ -299,6 +299,41 @@ func TestAdminCanSetProductColorAcrossProductMentions(t *testing.T) {
 	}
 }
 
+func TestAdminProductsPageUsesCollapsedListManagement(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRec := httptest.NewRecorder()
+	mux.ServeHTTP(loginRec, login)
+	if loginRec.Code != http.StatusFound {
+		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/products", nil)
+	for _, cookie := range loginRec.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("products status=%d, want %d; body=%s", rec.Code, http.StatusOK, body)
+	}
+	if !strings.Contains(body, `class="new-product-menu"`) || !strings.Contains(body, `<summary class="button primary">Add product</summary>`) {
+		t.Fatalf("products page should hide the new-product form behind an Add product button: %s", body)
+	}
+	if !strings.Contains(body, `class="product-list" role="list"`) || !strings.Contains(body, `class="product-list-item `) {
+		t.Fatalf("products page should render products as clickable list entries: %s", body)
+	}
+	if strings.Contains(body, `admin-products-table`) || strings.Contains(body, `<table`) {
+		t.Fatalf("products page should not render the management UI as a table: %s", body)
+	}
+}
+
 func TestAdminCanCreateRenameArchiveAndRestoreProduct(t *testing.T) {
 	a := testApp(t)
 	a.templates()
