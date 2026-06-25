@@ -447,3 +447,202 @@ func TestAdminCanCreateRenameArchiveAndRestoreProduct(t *testing.T) {
 		t.Fatalf("active qr commands after restore=%d, want 24", qrCount)
 	}
 }
+
+func TestAdminPlacesPageUsesCollapsedListManagement(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRec := httptest.NewRecorder()
+	mux.ServeHTTP(loginRec, login)
+	if loginRec.Code != http.StatusFound {
+		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/places", nil)
+	for _, cookie := range loginRec.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("places admin status=%d, want %d; body=%s", rec.Code, http.StatusOK, body)
+	}
+	if !strings.Contains(body, `class="new-product-menu"`) || !strings.Contains(body, `<summary class="button primary">Add place</summary>`) {
+		t.Fatalf("places page should hide the new-place form behind an Add place button: %s", body)
+	}
+	if !strings.Contains(body, `class="product-list" role="list"`) || !strings.Contains(body, `class="product-list-item `) {
+		t.Fatalf("places page should render places as clickable list entries: %s", body)
+	}
+	if strings.Contains(body, `<table`) {
+		t.Fatalf("places page should not render the management UI as a table: %s", body)
+	}
+}
+
+func TestAdminCanCreateRenameArchiveAndRestorePlace(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRec := httptest.NewRecorder()
+	mux.ServeHTTP(loginRec, login)
+	if loginRec.Code != http.StatusFound {
+		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
+	}
+	cookies := loginRec.Result().Cookies()
+	var csrf string
+	if err := a.db.QueryRow("select csrf from sessions where user_id='user_admin'").Scan(&csrf); err != nil {
+		t.Fatal(err)
+	}
+
+	form := "csrf=" + csrf + "&action=create&name=Back+Room"
+	req := httptest.NewRequest(http.MethodPost, "/admin/places", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("create status=%d, want %d; body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+
+	var placeID, name string
+	var active int
+	if err := a.db.QueryRow("select id,name,active from places where name='Back Room'").Scan(&placeID, &name, &active); err != nil {
+		t.Fatal(err)
+	}
+	if name != "Back Room" || active != 1 {
+		t.Fatalf("created place mismatch: id=%s name=%q active=%d", placeID, name, active)
+	}
+	var qrCount int
+	if err := a.db.QueryRow("select count(*) from qr_commands where place_id=? and active=1", placeID).Scan(&qrCount); err != nil {
+		t.Fatal(err)
+	}
+	if qrCount != 32 {
+		t.Fatalf("new place active qr commands=%d, want 32", qrCount)
+	}
+
+	form = "csrf=" + csrf + "&action=save&place_id=" + placeID + "&name=Front+Room"
+	req = httptest.NewRequest(http.MethodPost, "/admin/places", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("rename status=%d, want %d; body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+	if err := a.db.QueryRow("select name from places where id=?", placeID).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "Front Room" {
+		t.Fatalf("renamed place name=%q, want Front Room", name)
+	}
+
+	form = "csrf=" + csrf + "&action=archive&place_id=" + placeID
+	req = httptest.NewRequest(http.MethodPost, "/admin/places", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("archive status=%d, want %d", rec.Code, http.StatusSeeOther)
+	}
+	if err := a.db.QueryRow("select active from places where id=?", placeID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("active after archive=%d, want 0", active)
+	}
+	if err := a.db.QueryRow("select count(*) from qr_commands where place_id=? and active=1", placeID).Scan(&qrCount); err != nil {
+		t.Fatal(err)
+	}
+	if qrCount != 0 {
+		t.Fatalf("active qr commands after archive=%d, want 0", qrCount)
+	}
+
+	form = "csrf=" + csrf + "&action=restore&place_id=" + placeID
+	req = httptest.NewRequest(http.MethodPost, "/admin/places", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("restore status=%d, want %d", rec.Code, http.StatusSeeOther)
+	}
+	if err := a.db.QueryRow("select active from places where id=?", placeID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Fatalf("active after restore=%d, want 1", active)
+	}
+	if err := a.db.QueryRow("select count(*) from qr_commands where place_id=? and active=1", placeID).Scan(&qrCount); err != nil {
+		t.Fatal(err)
+	}
+	if qrCount != 32 {
+		t.Fatalf("active qr commands after restore=%d, want 32", qrCount)
+	}
+}
+
+func TestAdminPlacesWarnsButAllowsArchiveWithStock(t *testing.T) {
+	a := testApp(t)
+	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('stocked-place','org_dev','place_0','prod_0','user_admin',40,'add')")
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRec := httptest.NewRecorder()
+	mux.ServeHTTP(loginRec, login)
+	if loginRec.Code != http.StatusFound {
+		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/places", nil)
+	for _, cookie := range loginRec.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "This place contains current stock") || !strings.Contains(body, "Archive anyway?") {
+		t.Fatalf("places page should warn and confirm before archiving stocked places: %s", body)
+	}
+
+	var csrf string
+	if err := a.db.QueryRow("select csrf from sessions where user_id='user_admin'").Scan(&csrf); err != nil {
+		t.Fatal(err)
+	}
+	form := "csrf=" + csrf + "&action=archive&place_id=place_0"
+	req = httptest.NewRequest(http.MethodPost, "/admin/places", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range loginRec.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("archive status=%d, want %d", rec.Code, http.StatusSeeOther)
+	}
+	var active int
+	if err := a.db.QueryRow("select active from places where id='place_0'").Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("active after archive=%d, want 0", active)
+	}
+}
