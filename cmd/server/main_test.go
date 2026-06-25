@@ -91,13 +91,13 @@ func TestSeedCreatesApprovedDevelopmentUser(t *testing.T) {
 	}
 }
 
-func TestDevQRCodesPageLinksToScanRoutes(t *testing.T) {
+func TestAdminQRCodesPageLinksToScanRoutes(t *testing.T) {
 	a := testApp(t)
 	a.templates()
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=user%40example.com&password=password"))
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
 	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	loginRec := httptest.NewRecorder()
 	mux.ServeHTTP(loginRec, login)
@@ -109,21 +109,21 @@ func TestDevQRCodesPageLinksToScanRoutes(t *testing.T) {
 		t.Fatal("login did not set a session cookie")
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/dev/qr-codes", nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin/qr-codes", nil)
 	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("dev qr status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		t.Fatalf("admin qr status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "Development QR Codes") || !strings.Contains(body, "href=\"/scan/cmd-") || !strings.Contains(body, "Click any QR card") || !strings.Contains(body, "api.qrserver.com/v1/create-qr-code") || !strings.Contains(body, "Print matrix") {
-		t.Fatalf("dev QR page did not include clickable scan links and QR images: %s", body)
+	if !strings.Contains(body, "Development QR Codes") || !strings.Contains(body, "href=\"/scan/cmd-") || !strings.Contains(body, "Click any QR card") || !strings.Contains(body, "api.qrserver.com/v1/create-qr-code") || !strings.Contains(body, "Print matrix") || !strings.Contains(body, `class="admin-nav"`) {
+		t.Fatalf("admin QR page did not include admin navigation, clickable scan links, and QR images: %s", body)
 	}
 	if strings.Contains(body, "qr-url") || strings.Contains(body, "</span></a>") {
-		t.Fatalf("dev QR page should not render URL captions: %s", body)
+		t.Fatalf("admin QR page should not render URL captions: %s", body)
 	}
 }
 
