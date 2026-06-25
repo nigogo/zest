@@ -1,19 +1,30 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
   <title id="title">Zest logo</title>
-  <desc id="desc">A green-to-yellow spiral mark based on the provided Zest app icon.</desc>
+  <desc id="desc">A yellow and green spiral ribbon mark.</desc>
   <defs>
-    <linearGradient id="zestSpiral" x1="103" y1="404" x2="421" y2="92" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#78bd26"/>
-      <stop offset=".34" stop-color="#a9ca18"/>
-      <stop offset=".68" stop-color="#ffd300"/>
-      <stop offset="1" stop-color="#ffb300"/>
+    <linearGradient id="outer" x1="86" y1="382" x2="438" y2="113" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8fbe16"/>
+      <stop offset=".38" stop-color="#d5dc12"/>
+      <stop offset=".72" stop-color="#ffd80c"/>
+      <stop offset="1" stop-color="#f0a900"/>
     </linearGradient>
-    <linearGradient id="zestShade" x1="148" y1="353" x2="278" y2="184" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#5fa51f" stop-opacity=".48"/>
-      <stop offset="1" stop-color="#5fa51f" stop-opacity="0"/>
+    <linearGradient id="inner" x1="181" y1="333" x2="350" y2="168" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8ab914"/>
+      <stop offset=".42" stop-color="#ceda10"/>
+      <stop offset=".76" stop-color="#ffe100"/>
+      <stop offset="1" stop-color="#f2b000"/>
     </linearGradient>
+    <linearGradient id="shade" x1="130" y1="326" x2="272" y2="132" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6b980f" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#8fa700" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="soft" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#17212b" flood-opacity=".10"/>
+    </filter>
   </defs>
-  <path fill="url(#zestSpiral)" d="M421 377c-57 77-168 105-258 61C71 393 32 287 75 195 127 85 263 32 378 75c91 34 145 119 127 211-21-77-92-132-177-137-106-6-204 57-222 143-13 61 16 111 74 132 75 27 171-10 241-47z"/>
-  <path fill="url(#zestSpiral)" d="M323 164c69 21 111 82 96 144-18 74-100 123-177 106-69-15-112-72-98-131 18-77 109-130 187-110 48 13 84 45 97 86-31-41-92-59-146-37-48 20-79 65-68 100 10 33 53 48 95 33 36-13 64-45 60-72-3-23-28-37-58-31-22 4-43 18-58 37 7-52 38-107 70-125z"/>
-  <path fill="url(#zestShade)" d="M114 298c8-71 75-130 166-149-74 37-121 94-124 152-2 44 22 81 63 98-59-7-100-47-105-101z"/>
+  <rect width="512" height="512" rx="112" fill="none"/>
+  <path filter="url(#soft)" fill="url(#outer)" d="M419 334c-34 72-107 121-190 112C121 435 52 345 78 241c27-109 138-185 249-167 70 11 126 51 153 112-35-47-90-75-153-76-109-2-210 75-226 177-10 63 16 113 65 136 70 32 174 9 253-89z"/>
+  <path fill="url(#shade)" d="M132 361c-39-44-42-105-10-159 33-55 93-89 151-90-84 31-138 91-142 156-2 35 12 66 38 87 30 24 70 33 112 26-57 22-112 15-149-20z"/>
+  <path filter="url(#soft)" fill="url(#inner)" d="M296 185c54 4 87 43 77 91-11 55-71 100-130 99-55-1-94-36-92-85 3-68 78-127 146-134 49-5 88 10 105 39-34-28-90-30-139-3-50 28-80 76-67 112 12 35 60 49 105 29 38-17 63-52 55-79-6-23-34-33-65-24-20 6-38 20-48 36 5-45 32-85 53-82z"/>
+  <path fill="#fff7cf" opacity=".28" d="M157 156c89-95 244-90 310 31-63-76-168-99-262-58-22 9-40 19-48 27z"/>
 </svg>

@@ -216,10 +216,10 @@ func TestPlacesPageShowsStockOverviewInsteadOfActiveLabel(t *testing.T) {
 	if strings.Contains(body, `class="product-card product-default"`) || !strings.Contains(body, `class="place-card"`) {
 		t.Fatalf("places page should use distinct place cards: %s", body)
 	}
-	if !strings.Contains(body, `class="place-overview-item"`) || !strings.Contains(body, `class="product-badge product-lemon">Lemon</span>`) || !strings.Contains(body, "<strong>40</strong> units") {
+	if !strings.Contains(body, `class="place-overview-item product-lemon"`) || !strings.Contains(body, "<strong>40</strong> units") {
 		t.Fatalf("places page missing organized stock overview: %s", body)
 	}
-	if !strings.Contains(body, `class="product-badge product-lime">Lime</span>`) || !strings.Contains(body, "<strong>20</strong> units") {
+	if !strings.Contains(body, `class="place-overview-item product-lime"`) || !strings.Contains(body, "<strong>20</strong> units") {
 		t.Fatalf("places page missing second stock overview item: %s", body)
 	}
 }
