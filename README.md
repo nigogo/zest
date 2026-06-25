@@ -114,4 +114,4 @@ Key token groups include:
 
 The scan result undo panel uses HTMX for the server-backed undo request and hyperscript for the visible countdown/disabled state. The server remains authoritative for the undo window and writes a reversal event instead of changing or deleting the original inventory event.
 
-The logo mark is stored as `static/zest-logo.svg` and used in the mobile header, auth pages, and printable QR matrix branding.
+The logo mark is stored as `static/zest-logo.png` and used in the mobile header, auth pages, and printable QR matrix branding.
