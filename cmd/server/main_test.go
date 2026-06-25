@@ -298,3 +298,117 @@ func TestAdminCanSetProductColorAcrossProductMentions(t *testing.T) {
 		t.Fatalf("event amount should be shown on its own second line: %s", body)
 	}
 }
+
+func TestAdminCanCreateRenameArchiveAndRestoreProduct(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRec := httptest.NewRecorder()
+	mux.ServeHTTP(loginRec, login)
+	if loginRec.Code != http.StatusFound {
+		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
+	}
+	cookies := loginRec.Result().Cookies()
+	var csrf string
+	if err := a.db.QueryRow("select csrf from sessions where user_id='user_admin'").Scan(&csrf); err != nil {
+		t.Fatal(err)
+	}
+
+	form := "csrf=" + csrf + "&action=create&name=Blood+Orange&code=bo-1&unit=cases&color=%23ABCDEF"
+	req := httptest.NewRequest(http.MethodPost, "/admin/products", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("create status=%d, want %d; body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+
+	var productID, name, code, unit, color string
+	var active int
+	if err := a.db.QueryRow("select id,name,code,unit,color,active from products where code='BO-1'").Scan(&productID, &name, &code, &unit, &color, &active); err != nil {
+		t.Fatal(err)
+	}
+	if name != "Blood Orange" || code != "BO-1" || unit != "cases" || color != "#ABCDEF" || active != 1 {
+		t.Fatalf("created product mismatch: id=%s name=%q code=%q unit=%q color=%q active=%d", productID, name, code, unit, color, active)
+	}
+	var qrCount int
+	if err := a.db.QueryRow("select count(*) from qr_commands where product_id=? and active=1", productID).Scan(&qrCount); err != nil {
+		t.Fatal(err)
+	}
+	if qrCount != 24 {
+		t.Fatalf("new product active qr commands=%d, want 24", qrCount)
+	}
+
+	form = "csrf=" + csrf + "&action=save&product_id=" + productID + "&name=Ruby+Orange&code=ruby&unit=boxes&color=%23112233"
+	req = httptest.NewRequest(http.MethodPost, "/admin/products", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("rename status=%d, want %d; body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+	if err := a.db.QueryRow("select name,code,unit,color from products where id=?", productID).Scan(&name, &code, &unit, &color); err != nil {
+		t.Fatal(err)
+	}
+	if name != "Ruby Orange" || code != "RUBY" || unit != "boxes" || color != "#112233" {
+		t.Fatalf("renamed product mismatch: name=%q code=%q unit=%q color=%q", name, code, unit, color)
+	}
+
+	form = "csrf=" + csrf + "&action=archive&product_id=" + productID
+	req = httptest.NewRequest(http.MethodPost, "/admin/products", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("archive status=%d, want %d", rec.Code, http.StatusSeeOther)
+	}
+	if err := a.db.QueryRow("select active from products where id=?", productID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("active after archive=%d, want 0", active)
+	}
+	if err := a.db.QueryRow("select count(*) from qr_commands where product_id=? and active=1", productID).Scan(&qrCount); err != nil {
+		t.Fatal(err)
+	}
+	if qrCount != 0 {
+		t.Fatalf("active qr commands after archive=%d, want 0", qrCount)
+	}
+
+	form = "csrf=" + csrf + "&action=restore&product_id=" + productID
+	req = httptest.NewRequest(http.MethodPost, "/admin/products", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("restore status=%d, want %d", rec.Code, http.StatusSeeOther)
+	}
+	if err := a.db.QueryRow("select active from products where id=?", productID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Fatalf("active after restore=%d, want 1", active)
+	}
+	if err := a.db.QueryRow("select count(*) from qr_commands where product_id=? and active=1", productID).Scan(&qrCount); err != nil {
+		t.Fatal(err)
+	}
+	if qrCount != 24 {
+		t.Fatalf("active qr commands after restore=%d, want 24", qrCount)
+	}
+}
