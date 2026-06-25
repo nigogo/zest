@@ -186,3 +186,40 @@ func TestGermanHelpersTranslateUnitsAndEventText(t *testing.T) {
 		t.Fatalf("eventText subtract=%q", got)
 	}
 }
+
+func TestPlacesPageShowsStockOverviewInsteadOfActiveLabel(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('overview1','org_dev','place_0','prod_0','user_admin',40,'add')")
+	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('overview2','org_dev','place_0','prod_1','user_admin',20,'add')")
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=user%40example.com&password=password"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRec := httptest.NewRecorder()
+	mux.ServeHTTP(loginRec, login)
+
+	req := httptest.NewRequest(http.MethodGet, "/places", nil)
+	for _, cookie := range loginRec.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("places status=%d, want %d; body=%s", rec.Code, http.StatusOK, body)
+	}
+	if strings.Contains(body, `class="pill">Active`) {
+		t.Fatalf("places page still shows active label: %s", body)
+	}
+	if strings.Contains(body, `class="product-card product-default"`) || !strings.Contains(body, `class="place-card"`) {
+		t.Fatalf("places page should use distinct place cards: %s", body)
+	}
+	if !strings.Contains(body, `class="place-overview-item"`) || !strings.Contains(body, "<dt>Lemon</dt>") || !strings.Contains(body, "<strong>40</strong> units") {
+		t.Fatalf("places page missing organized stock overview: %s", body)
+	}
+	if !strings.Contains(body, "<dt>Lime</dt>") || !strings.Contains(body, "<strong>20</strong> units") {
+		t.Fatalf("places page missing second stock overview item: %s", body)
+	}
+}
