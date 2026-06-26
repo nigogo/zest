@@ -48,9 +48,68 @@ func env(k, d string) string {
 	}
 	return d
 }
+
+func loadEnvFile(path string) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("could not read %s: %v", path, err)
+		}
+		return
+	}
+	for i, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			log.Printf("ignoring malformed env line %d in %s", i+1, path)
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		val = strings.Trim(val, `"'`)
+		if key == "" || os.Getenv(key) != "" {
+			continue
+		}
+		if err := os.Setenv(key, val); err != nil {
+			log.Printf("could not set %s from %s: %v", key, path, err)
+		}
+	}
+}
+
+func durationEnv(k string, d time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return d
+	}
+	seconds, err := strconv.Atoi(v)
+	if err != nil || seconds <= 0 {
+		log.Printf("invalid %s=%q; using %s", k, v, d)
+		return d
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func validateProductionConfig() {
+	if env("APP_ENV", "development") != "production" {
+		return
+	}
+	if strings.Contains(env("APP_BASE_URL", ""), "localhost") {
+		log.Fatal("APP_BASE_URL must be set to the production public URL when APP_ENV=production")
+	}
+	if env("SESSION_SECRET", "dev-secret-change-me") == "dev-secret-change-me" {
+		log.Fatal("SESSION_SECRET must be changed when APP_ENV=production")
+	}
+	if env("SEED_ADMIN_PASSWORD", "admin123-change-me") == "admin123-change-me" {
+		log.Fatal("SEED_ADMIN_PASSWORD must be changed when APP_ENV=production")
+	}
+}
+
 func id() string { b := make([]byte, 18); rand.Read(b); return base64.RawURLEncoding.EncodeToString(b) }
 func hashpw(p string) string {
-	s := sha256.Sum256([]byte("zest-dev-salt:" + p))
+	s := sha256.Sum256([]byte(env("SESSION_SECRET", "dev-secret-change-me") + ":" + p))
 	return base64.RawURLEncoding.EncodeToString(s[:])
 }
 
@@ -61,7 +120,9 @@ func must(err error) {
 }
 
 func main() {
-	a := &App{base: env("APP_BASE_URL", "http://localhost:8765"), addr: env("APP_ADDR", ":8765"), env: env("APP_ENV", "development"), undoWindow: 20 * time.Second}
+	loadEnvFile(env("ENV_FILE", ".env"))
+	validateProductionConfig()
+	a := &App{base: env("APP_BASE_URL", "http://localhost:8765"), addr: env("APP_ADDR", ":8765"), env: env("APP_ENV", "development"), undoWindow: durationEnv("UNDO_WINDOW_SECONDS", 20*time.Second)}
 	a.secure = a.env == "production"
 	for _, s := range strings.Split(env("COMMON_AMOUNTS", "10,20,40,60"), ",") {
 		n, _ := strconv.Atoi(strings.TrimSpace(s))
@@ -489,7 +550,7 @@ var germanMessages = map[string]string{
 	"printqr.open_home":       "Hauptseite öffnen",
 	"printqr.command":         "Bestand buchen",
 	"printqr.label":           "Label",
-	"printqr.placeholder": "Optionales eigenes Label",
+	"printqr.placeholder":     "Optionales eigenes Label",
 	"printqr.delete":          "Löschen",
 	"printqr.print":           "Druckmatrix",
 	"printqr.empty":           "Noch keine Druck-QR-Codes vorbereitet.",
@@ -666,7 +727,7 @@ var englishMessages = map[string]string{
 	"printqr.open_home":       "Open main page",
 	"printqr.command":         "Book stock",
 	"printqr.label":           "Label",
-	"printqr.placeholder": "Optional custom label",
+	"printqr.placeholder":     "Optional custom label",
 	"printqr.delete":          "Delete",
 	"printqr.print":           "Print matrix",
 	"printqr.empty":           "No print QR codes prepared yet.",
