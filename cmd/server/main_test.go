@@ -131,6 +131,47 @@ func TestAdminQRCodesPageLinksToScanRoutes(t *testing.T) {
 	}
 }
 
+func TestPrintQRCodesPageGroupsCodesByPlace(t *testing.T) {
+	a := testApp(t)
+	var freezerACommand, freezerBCommand string
+	if err := a.db.QueryRow("select id from qr_commands where place_id='place_0' and product_id='prod_0' and action='add' and amount=10").Scan(&freezerACommand); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.db.QueryRow("select id from qr_commands where place_id='place_1' and product_id='prod_1' and action='subtract' and amount=20").Scan(&freezerBCommand); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec(`insert into print_qr_codes(id,organization_id,label,kind,place_id,qr_command_id,position) values
+		('print_home','org_dev','Home','home',null,null,1),
+		('print_place_a','org_dev','Freezer A place','place','place_0',null,2),
+		('print_cmd_a','org_dev','Add lemons','command','place_0',?,3),
+		('print_cmd_b','org_dev','Subtract limes','command','place_1',?,4)`, freezerACommand, freezerBCommand); err != nil {
+		t.Fatal(err)
+	}
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	cookies := loginAs(t, a, "user_admin")
+	req := httptest.NewRequest(http.MethodGet, "/admin/print-qr-codes", nil)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("print QR status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"General token QR codes", "Freezer A", "Freezer B", "Home", "Freezer A place", "Add lemons", "Subtract limes"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("print QR page missing grouped content %q: %s", want, body)
+		}
+	}
+	if strings.Index(body, "<h2>General token QR codes</h2>") > strings.Index(body, "<h2>Freezer A</h2>") || strings.Index(body, "<h2>Freezer A</h2>") > strings.Index(body, "<h2>Freezer B</h2>") {
+		t.Fatalf("print QR groups are not ordered with general first and places after: %s", body)
+	}
+}
+
 func TestScanHomeRendersCameraScanner(t *testing.T) {
 	a := testApp(t)
 	a.templates()
