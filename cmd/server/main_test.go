@@ -151,13 +151,18 @@ func TestScanHomeRendersCameraScanner(t *testing.T) {
 		t.Fatalf("scan status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Scan QR code", `id="qr-video"`, "BarcodeDetector", "navigator.mediaDevices.getUserMedia", "Paste scan link manually"} {
+	for _, want := range []string{"Scan QR code", `id="qr-video"`, "BarcodeDetector", "navigator.mediaDevices.getUserMedia"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("scan page missing %q: %s", want, body)
 		}
 	}
 	if rec.Result().Header.Get("Location") == "/dev/qr-codes" {
 		t.Fatalf("scan page should render scanner instead of redirecting to dev QR codes")
+	}
+	for _, unwanted := range []string{"Paste scan link manually", "Show dev QRs", `data-scan-manual`, `bottom-action-bar`} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("scan page should not include %q: %s", unwanted, body)
+		}
 	}
 }
 
