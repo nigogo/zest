@@ -14,12 +14,14 @@ Zest is a small, server-rendered Go application for applying inventory movements
 
 ## Environment
 
-Defaults:
+The server loads environment variables from `.env` by default before reading configuration. Values already exported in the shell take precedence, and production servers can replace `.env` or set `ENV_FILE=/path/to/envfile`.
+
+Defaults in the committed `.env` file:
 
 ```txt
 APP_ENV=development
-APP_BASE_URL=http://localhost:8080
-APP_ADDR=:8080
+APP_BASE_URL=http://localhost:8765
+APP_ADDR=:8765
 DATABASE_PATH=./data/app.db
 SESSION_SECRET=dev-secret-change-me
 UNDO_WINDOW_SECONDS=20
@@ -29,6 +31,8 @@ SEED_ADMIN_PASSWORD=admin123-change-me
 SEED_USER_EMAIL=user@example.com
 SEED_USER_PASSWORD=password
 ```
+
+When `APP_ENV=production`, set `APP_BASE_URL` to the public production URL and replace `SESSION_SECRET` and `SEED_ADMIN_PASSWORD`; the server refuses to start with the local defaults for those values.
 
 ## Setup and Run
 
