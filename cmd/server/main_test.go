@@ -127,6 +127,40 @@ func TestAdminQRCodesPageLinksToScanRoutes(t *testing.T) {
 	}
 }
 
+func TestScanHomeRendersCameraScanner(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=user%40example.com&password=password"))
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginRec := httptest.NewRecorder()
+	mux.ServeHTTP(loginRec, login)
+	if loginRec.Code != http.StatusFound {
+		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/scan", nil)
+	for _, cookie := range loginRec.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scan status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"Scan QR code", `id="qr-video"`, "BarcodeDetector", "navigator.mediaDevices.getUserMedia", "Paste scan link manually"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("scan page missing %q: %s", want, body)
+		}
+	}
+	if rec.Result().Header.Get("Location") == "/dev/qr-codes" {
+		t.Fatalf("scan page should render scanner instead of redirecting to dev QR codes")
+	}
+}
+
 func TestPreferredLanguageUsesAcceptLanguage(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/login", nil)
 	req.Header.Set("Accept-Language", "de-DE,de;q=0.9,en;q=0.8")
