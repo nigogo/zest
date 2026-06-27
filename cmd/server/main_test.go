@@ -367,8 +367,15 @@ func TestGermanHelpersTranslateUnitsAndEventText(t *testing.T) {
 func TestPlacesPageShowsStockOverviewInsteadOfActiveLabel(t *testing.T) {
 	a := testApp(t)
 	a.templates()
+	a.db.Exec("insert into products(id,organization_id,name,code,unit,color,active) values('prod_3','org_dev','Grapefruit','P4','units','#E85D75',1)")
+	a.db.Exec("insert into products(id,organization_id,name,code,unit,color,active) values('prod_4','org_dev','Blood Orange','P5','units','#F28C28',1)")
+	a.db.Exec("insert into products(id,organization_id,name,code,unit,color,active) values('prod_5','org_dev','Pomelo','P6','units','#F5B700',1)")
 	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('overview1','org_dev','place_0','prod_0','user_admin',40,'add')")
 	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('overview2','org_dev','place_0','prod_1','user_admin',20,'add')")
+	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('overview3','org_dev','place_0','prod_2','user_admin',15,'add')")
+	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('overview4','org_dev','place_0','prod_3','user_admin',10,'add')")
+	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('overview5','org_dev','place_0','prod_4','user_admin',5,'add')")
+	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('overview6','org_dev','place_0','prod_5','user_admin',1,'add')")
 	mux := http.NewServeMux()
 	a.routes(mux)
 
@@ -395,6 +402,14 @@ func TestPlacesPageShowsStockOverviewInsteadOfActiveLabel(t *testing.T) {
 	}
 	if !strings.Contains(body, `class="place-overview-item product-lime"`) || !strings.Contains(body, "<strong>20</strong> units") {
 		t.Fatalf("places page missing second stock overview item: %s", body)
+	}
+	for _, want := range []string{"<strong>15</strong> units", "<strong>10</strong> units", "<strong>5</strong> units"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("places page should show up to five stock overview items, missing %s: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "Pomelo") || strings.Contains(body, "<strong>1</strong> units") {
+		t.Fatalf("places page should limit stock overview to five products: %s", body)
 	}
 }
 

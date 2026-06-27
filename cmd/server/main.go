@@ -1740,7 +1740,7 @@ func (a *App) places(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) placeStockOverview(c Ctx, placeID string) []map[string]any {
-	rows, err := a.db.Query(`select p.name,p.unit,coalesce(p.color,''),coalesce(sum(e.quantity_delta),0) as stock from products p left join inventory_events e on e.product_id=p.id and e.place_id=? where p.organization_id=? and p.active=1 group by p.id order by stock desc,p.name limit 3`, placeID, c.OrgID)
+	rows, err := a.db.Query(`select p.name,p.unit,coalesce(p.color,''),coalesce(sum(e.quantity_delta),0) as stock from products p left join inventory_events e on e.product_id=p.id and e.place_id=? where p.organization_id=? and p.active=1 group by p.id order by stock desc,p.name limit 5`, placeID, c.OrgID)
 	if err != nil {
 		return nil
 	}
