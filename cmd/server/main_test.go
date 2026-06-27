@@ -926,3 +926,40 @@ func TestProtectedHTMXRequestUsesHXRedirect(t *testing.T) {
 		t.Fatalf("HX-Redirect=%q, want login redirect", got)
 	}
 }
+
+func TestAdminDashboardShowsRealLinkedMetrics(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	a.db.Exec("insert into users(id,email,name,password_hash,provider,provider_subject,email_verified) values('pending_user','pending@example.com','Pending','','dev','pending_user',1)")
+	a.db.Exec("insert into memberships(id,organization_id,user_id,role,status) values('mem_pending','org_dev','pending_user','operator','pending')")
+	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('dash_e1','org_dev','place_0','prod_0','user_admin',20,'add')")
+	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('dash_e2','org_dev','place_1','prod_1','user_admin',-5,'subtract')")
+
+	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	for _, cookie := range loginAs(t, a, "user_admin") {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	a.routes(mux)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin dashboard status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`href="/admin/reports"><span>Total stock</span><strong>15</strong>`,
+		`href="/admin/events"><span>Events today</span><strong>2</strong>`,
+		`href="/admin/memberships"><span>Pending approvals</span><strong>1</strong>`,
+		`href="/admin/reports"><span>Negative stock</span><strong>1</strong>`,
+		`href="/admin/places"><span>Active places</span><strong>3</strong>`,
+		`href="/admin/products"><span>Active products</span><strong>4</strong>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("admin dashboard missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "<strong>—</strong>") {
+		t.Fatalf("admin dashboard should not show placeholder metrics: %s", body)
+	}
+}
