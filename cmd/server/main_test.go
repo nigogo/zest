@@ -151,7 +151,7 @@ func TestScanHomeRendersCameraScanner(t *testing.T) {
 		t.Fatalf("scan status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Scan QR code", `id="qr-video"`, "BarcodeDetector", "navigator.mediaDevices.getUserMedia", "visualViewport", "--scan-vh", "jsQR", `id="camera-start"`} {
+	for _, want := range []string{"Scan QR code", `id="qr-video"`, "visualViewport", "--scan-vh", "jsQR", `id="camera-start"`, `id="qr-upload"`, `capture="environment"`, "/static/qr_scanner.js"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("scan page missing %q: %s", want, body)
 		}
@@ -163,6 +163,35 @@ func TestScanHomeRendersCameraScanner(t *testing.T) {
 		if strings.Contains(body, unwanted) {
 			t.Fatalf("scan page should not include %q: %s", unwanted, body)
 		}
+	}
+}
+
+func TestQRScannerScriptDefinesUnifiedLifecycle(t *testing.T) {
+	body, err := os.ReadFile("../../static/qr_scanner.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(body)
+	for _, want := range []string{
+		"function createQRCodeScanner",
+		"startScanner",
+		"stopScanner",
+		"onScanSuccess",
+		"onScanError",
+		"navigator.mediaDevices.getUserMedia",
+		`facingMode: { ideal: "environment" }`,
+		"stream.getTracks().forEach",
+		"video.playsInline = true",
+		"decodeImageFile",
+		"jsQR(ctx.getImageData",
+		"if (completed) return",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("scanner script missing %q", want)
+		}
+	}
+	if strings.Contains(script, "BarcodeDetector") || strings.Contains(script, "BarcodeScanner") {
+		t.Fatalf("scanner should use a unified QR decoder flow instead of native barcode APIs")
 	}
 }
 
