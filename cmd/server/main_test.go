@@ -750,6 +750,9 @@ func TestLoginPageUsesAuth0Button(t *testing.T) {
 	if !strings.Contains(body, "/auth/login?return=%2fsettings") || !strings.Contains(body, "Log in with Auth0") {
 		t.Fatalf("login page missing Auth0 login link: %s", body)
 	}
+	if !strings.Contains(body, "/dev/login?user=operator&return=%2fsettings") || !strings.Contains(body, "Log in as dev admin") {
+		t.Fatalf("development login page missing dev bypass links: %s", body)
+	}
 	if strings.Contains(body, `name="password"`) || strings.Contains(body, `href="/register"`) {
 		t.Fatalf("login page should not include password login or registration: %s", body)
 	}
@@ -790,6 +793,52 @@ func TestAuthLoginRedirectsToAuth0Authorize(t *testing.T) {
 	var count int
 	if err := a.db.QueryRow("select count(*) from oauth_states where return_path='/settings'").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("oauth state count=%d err=%v, want 1", count, err)
+	}
+}
+
+func TestAuthLoginFallsBackToDevLoginWithoutAuth0InDevelopment(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/login?return=%2fsettings", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("auth login fallback status=%d, want %d", rec.Code, http.StatusFound)
+	}
+	loc := rec.Result().Header.Get("Location")
+	if !strings.HasPrefix(loc, "/dev/login?return=%2Fsettings") {
+		t.Fatalf("auth login fallback location=%q, want dev login", loc)
+	}
+}
+
+func TestDevLoginCreatesLocalDevelopmentSession(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/dev/login?user=admin&return=/admin", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("dev login status=%d, want %d", rec.Code, http.StatusFound)
+	}
+	if loc := rec.Result().Header.Get("Location"); loc != "/admin" {
+		t.Fatalf("dev login redirect=%q, want /admin", loc)
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) == 0 || cookies[0].Name != "sid" {
+		t.Fatalf("dev login did not set sid cookie: %#v", cookies)
+	}
+	var userID string
+	if err := a.db.QueryRow("select user_id from sessions where token=?", cookies[0].Value).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if userID != "user_admin" {
+		t.Fatalf("dev login user=%q, want user_admin", userID)
 	}
 }
 
