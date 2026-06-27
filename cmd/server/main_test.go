@@ -151,7 +151,7 @@ func TestScanHomeRendersCameraScanner(t *testing.T) {
 		t.Fatalf("scan status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Scan QR code", `id="qr-video"`, "visualViewport", "--scan-vh", "jsQR", `id="camera-start"`, `id="qr-upload"`, `capture="environment"`, "/static/qr_scanner.js"} {
+	for _, want := range []string{"Scan QR code", `id="qr-video"`, "visualViewport", "--scan-vh", "jsQR", `id="camera-start"`, "/static/qr_scanner.js"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("scan page missing %q: %s", want, body)
 		}
@@ -159,7 +159,7 @@ func TestScanHomeRendersCameraScanner(t *testing.T) {
 	if rec.Result().Header.Get("Location") == "/dev/qr-codes" {
 		t.Fatalf("scan page should render scanner instead of redirecting to dev QR codes")
 	}
-	for _, unwanted := range []string{"Paste scan link manually", "Show dev QRs", `data-scan-manual`, `bottom-action-bar`} {
+	for _, unwanted := range []string{"Paste scan link manually", "Show dev QRs", `data-scan-manual`, `bottom-action-bar`, `id="qr-upload"`, `capture="environment"`, "Upload QR image"} {
 		if strings.Contains(body, unwanted) {
 			t.Fatalf("scan page should not include %q: %s", unwanted, body)
 		}
@@ -183,6 +183,9 @@ func TestQRScannerScriptDefinesUnifiedLifecycle(t *testing.T) {
 		"stream.getTracks().forEach",
 		"video.playsInline = true",
 		"decodeImageFile",
+		"BarcodeDetector",
+		"new BarcodeDetector",
+		"barcodeDetector.detect(video)",
 		"jsQR(ctx.getImageData",
 		"if (completed) return",
 	} {
@@ -190,8 +193,24 @@ func TestQRScannerScriptDefinesUnifiedLifecycle(t *testing.T) {
 			t.Fatalf("scanner script missing %q", want)
 		}
 	}
-	if strings.Contains(script, "BarcodeDetector") || strings.Contains(script, "BarcodeScanner") {
-		t.Fatalf("scanner should use a unified QR decoder flow instead of native barcode APIs")
+	if strings.Contains(script, "BarcodeScanner") {
+		t.Fatalf("scanner should not use BarcodeScanner")
+	}
+}
+
+func TestStaticJavaScriptServedWithJavaScriptContentType(t *testing.T) {
+	a := testApp(t)
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/static/qr_scanner.js", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("static js status=%d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Result().Header.Get("Content-Type"); !strings.HasPrefix(got, "application/javascript") {
+		t.Fatalf("static js Content-Type=%q, want application/javascript", got)
 	}
 }
 

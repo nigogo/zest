@@ -12,6 +12,7 @@
     var scanning = false;
     var completed = false;
     var frameHandle = 0;
+    var detector = null;
     var canvas = document.createElement("canvas");
     var ctx = canvas.getContext("2d", { willReadFrequently: true });
 
@@ -23,6 +24,12 @@
       if (!status) return;
       status.textContent = message(key, fallback);
       status.className = "status-banner " + (cls || "status-info");
+    }
+
+    function showStartButton(show) {
+      if (!startButton) return;
+      startButton.hidden = !show;
+      startButton.disabled = !show;
     }
 
     function stopScanner() {
@@ -37,10 +44,7 @@
         stream = null;
       }
       if (video) video.srcObject = null;
-      if (startButton && !completed) {
-        startButton.hidden = false;
-        startButton.disabled = false;
-      }
+      if (!completed) showStartButton(true);
     }
 
     function fail(key, fallback, error) {
@@ -49,18 +53,43 @@
       if (typeof onScanError === "function") onScanError(error || new Error(fallback));
     }
 
-    function decodeCurrentFrame() {
-      if (typeof jsQR !== "function") {
-        fail("failed", "Scan failed, try again", new Error("jsQR is not loaded"));
-        return null;
+    function createBarcodeDetector() {
+      if (detector !== null) return detector;
+      detector = false;
+      if (typeof BarcodeDetector !== "function") return detector;
+      try {
+        detector = new BarcodeDetector({ formats: ["qr_code"] });
+      } catch (error) {
+        detector = false;
       }
+      return detector;
+    }
+
+    function decodeWithJsQR() {
+      if (typeof jsQR !== "function") return null;
       if (!ctx || !video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return null;
       var max = 720;
       var scale = Math.min(1, max / Math.max(video.videoWidth, video.videoHeight));
       canvas.width = Math.max(1, Math.floor(video.videoWidth * scale));
       canvas.height = Math.max(1, Math.floor(video.videoHeight * scale));
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      return jsQR(ctx.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height, { inversionAttempts: "attemptBoth" });
+      var code = jsQR(ctx.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height, { inversionAttempts: "attemptBoth" });
+      return code && code.data ? code.data : null;
+    }
+
+    async function decodeCurrentFrame() {
+      var barcodeDetector = createBarcodeDetector();
+      if (barcodeDetector) {
+        try {
+          var barcodes = await barcodeDetector.detect(video);
+          if (barcodes && barcodes[0] && (barcodes[0].rawValue || barcodes[0].data)) {
+            return barcodes[0].rawValue || barcodes[0].data;
+          }
+        } catch (error) {
+          detector = false;
+        }
+      }
+      return decodeWithJsQR();
     }
 
     function finish(result) {
@@ -71,12 +100,12 @@
       if (typeof onScanSuccess === "function") onScanSuccess(result);
     }
 
-    function scanFrame() {
+    async function scanFrame() {
       if (!scanning || completed) return;
       try {
-        var code = decodeCurrentFrame();
-        if (code && code.data) {
-          finish(code.data);
+        var result = await decodeCurrentFrame();
+        if (result) {
+          finish(result);
           return;
         }
         setStatus("none", "No QR code detected yet", "status-info");
@@ -97,12 +126,12 @@
         fail("unavailable", "Camera unavailable", new Error("getUserMedia is not supported"));
         return;
       }
-      if (typeof jsQR !== "function") {
+      if (!createBarcodeDetector() && typeof jsQR !== "function") {
         fail("failed", "Scan failed, try again", new Error("QR decoder is not available"));
         return;
       }
       setStatus("starting", "Starting camera…", "status-info");
-      if (startButton) startButton.disabled = true;
+      showStartButton(false);
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
         if (!stream || stream.getTracks().length === 0) {
@@ -115,7 +144,6 @@
         video.playsInline = true;
         await video.play();
         scanning = true;
-        if (startButton) startButton.hidden = true;
         setStatus("scanning", "Scanning…", "status-info");
         frameHandle = requestAnimationFrame(scanFrame);
       } catch (error) {
