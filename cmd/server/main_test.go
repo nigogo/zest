@@ -151,7 +151,7 @@ func TestScanHomeRendersCameraScanner(t *testing.T) {
 		t.Fatalf("scan status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Scan QR code", `id="qr-video"`, "BarcodeDetector", "navigator.mediaDevices.getUserMedia"} {
+	for _, want := range []string{"Scan QR code", `id="qr-video"`, "BarcodeDetector", "navigator.mediaDevices.getUserMedia", "visualViewport", "--scan-vh"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("scan page missing %q: %s", want, body)
 		}
