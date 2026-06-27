@@ -115,6 +115,17 @@ func TestAdminQRCodesPageLinksToScanRoutes(t *testing.T) {
 	if !strings.Contains(body, "Development QR Codes") || !strings.Contains(body, "href=\"/scan/cmd-") || !strings.Contains(body, "href=\"/scan/amount/amt-") || !strings.Contains(body, "Click any QR card") || !strings.Contains(body, "api.qrserver.com/v1/create-qr-code") || !strings.Contains(body, "Print matrix") || !strings.Contains(body, `class="admin-nav"`) {
 		t.Fatalf("admin QR page did not include admin navigation, clickable scan links, and QR images: %s", body)
 	}
+	for _, want := range []string{"General token QR codes", "Invite", "Freezer A", "Freezer B", "Freezer C", "Place link", `href="/org/join/dev-invite-token"`, `href="/places/place-`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("admin QR page missing dev bucket content %q: %s", want, body)
+		}
+	}
+	if got := strings.Count(body, `href="/scan/cmd-`); got != 96 {
+		t.Fatalf("fixed amount dev QR links=%d, want 96", got)
+	}
+	if got := strings.Count(body, `href="/scan/amount/amt-`); got != 24 {
+		t.Fatalf("variable amount dev QR links=%d, want 24", got)
+	}
 	if strings.Contains(body, "qr-url") || strings.Contains(body, "</span></a>") {
 		t.Fatalf("admin QR page should not render URL captions: %s", body)
 	}
