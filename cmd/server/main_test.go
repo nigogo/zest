@@ -45,8 +45,8 @@ func TestSeedCreatesQRCommands(t *testing.T) {
 	if err := a.db.QueryRow("select count(*) from qr_commands").Scan(&c); err != nil {
 		t.Fatal(err)
 	}
-	if c != 96 {
-		t.Fatalf("qr commands=%d, want 96", c)
+	if c != 120 {
+		t.Fatalf("qr commands=%d, want 120", c)
 	}
 }
 
@@ -60,8 +60,8 @@ func TestSeedBackfillsMissingQRCommands(t *testing.T) {
 	if err := a.db.QueryRow("select count(*) from qr_commands").Scan(&c); err != nil {
 		t.Fatal(err)
 	}
-	if c != 96 {
-		t.Fatalf("qr commands=%d, want 96 after backfill", c)
+	if c != 120 {
+		t.Fatalf("qr commands=%d, want 120 after backfill", c)
 	}
 }
 
@@ -112,7 +112,7 @@ func TestAdminQRCodesPageLinksToScanRoutes(t *testing.T) {
 		t.Fatalf("admin qr status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "Development QR Codes") || !strings.Contains(body, "href=\"/scan/cmd-") || !strings.Contains(body, "Click any QR card") || !strings.Contains(body, "api.qrserver.com/v1/create-qr-code") || !strings.Contains(body, "Print matrix") || !strings.Contains(body, `class="admin-nav"`) {
+	if !strings.Contains(body, "Development QR Codes") || !strings.Contains(body, "href=\"/scan/cmd-") || !strings.Contains(body, "href=\"/scan/amount/amt-") || !strings.Contains(body, "Click any QR card") || !strings.Contains(body, "api.qrserver.com/v1/create-qr-code") || !strings.Contains(body, "Print matrix") || !strings.Contains(body, `class="admin-nav"`) {
 		t.Fatalf("admin QR page did not include admin navigation, clickable scan links, and QR images: %s", body)
 	}
 	if strings.Contains(body, "qr-url") || strings.Contains(body, "</span></a>") {
@@ -150,6 +150,61 @@ func TestScanHomeRendersCameraScanner(t *testing.T) {
 		if strings.Contains(body, unwanted) {
 			t.Fatalf("scan page should not include %q: %s", unwanted, body)
 		}
+	}
+}
+
+func TestAmountScanRequiresOnlyAmountAndCreatesEvent(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	var token string
+	if err := a.db.QueryRow("select token from qr_commands where place_id='place_0' and product_id='prod_0' and action='subtract' and amount=0").Scan(&token); err != nil {
+		t.Fatal(err)
+	}
+	cookies := loginAs(t, a, "user_dev")
+
+	req := httptest.NewRequest(http.MethodGet, "/scan/amount/"+token, nil)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("amount scan status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"QR amount entry", "Subtract Lemon", "Freezer A", `id="qr-amount"`, `data-step="-10"`, `data-step="10"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("amount scan page missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, `name="place_id"`) || strings.Contains(body, `name="product_id"`) {
+		t.Fatalf("amount scan page should not ask for place or product: %s", body)
+	}
+
+	var csrf string
+	if err := a.db.QueryRow("select csrf from sessions where user_id='user_dev'").Scan(&csrf); err != nil {
+		t.Fatal(err)
+	}
+	form := "csrf=" + csrf + "&amount=7"
+	req = httptest.NewRequest(http.MethodPost, "/scan/amount/"+token, strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("amount scan post status=%d, want %d; body=%s", rec.Code, http.StatusSeeOther, rec.Body.String())
+	}
+	var delta int
+	if err := a.db.QueryRow("select quantity_delta from inventory_events where note='QR amount entry'").Scan(&delta); err != nil {
+		t.Fatal(err)
+	}
+	if delta != -7 {
+		t.Fatalf("amount scan delta=%d, want -7", delta)
 	}
 }
 
@@ -422,8 +477,8 @@ func TestAdminCanCreateRenameArchiveAndRestoreProduct(t *testing.T) {
 	if err := a.db.QueryRow("select count(*) from qr_commands where product_id=? and active=1", productID).Scan(&qrCount); err != nil {
 		t.Fatal(err)
 	}
-	if qrCount != 24 {
-		t.Fatalf("new product active qr commands=%d, want 24", qrCount)
+	if qrCount != 30 {
+		t.Fatalf("new product active qr commands=%d, want 30", qrCount)
 	}
 
 	form = "csrf=" + csrf + "&action=save&product_id=" + productID + "&name=Ruby+Orange&code=ruby&unit=boxes&color=%23112233"
@@ -488,8 +543,8 @@ func TestAdminCanCreateRenameArchiveAndRestoreProduct(t *testing.T) {
 	if err := a.db.QueryRow("select count(*) from qr_commands where product_id=? and active=1", productID).Scan(&qrCount); err != nil {
 		t.Fatal(err)
 	}
-	if qrCount != 24 {
-		t.Fatalf("active qr commands after restore=%d, want 24", qrCount)
+	if qrCount != 30 {
+		t.Fatalf("active qr commands after restore=%d, want 30", qrCount)
 	}
 }
 
@@ -561,8 +616,8 @@ func TestAdminCanCreateRenameArchiveAndRestorePlace(t *testing.T) {
 	if err := a.db.QueryRow("select count(*) from qr_commands where place_id=? and active=1", placeID).Scan(&qrCount); err != nil {
 		t.Fatal(err)
 	}
-	if qrCount != 32 {
-		t.Fatalf("new place active qr commands=%d, want 32", qrCount)
+	if qrCount != 40 {
+		t.Fatalf("new place active qr commands=%d, want 40", qrCount)
 	}
 
 	form = "csrf=" + csrf + "&action=save&place_id=" + placeID + "&name=Front+Room"
@@ -627,8 +682,8 @@ func TestAdminCanCreateRenameArchiveAndRestorePlace(t *testing.T) {
 	if err := a.db.QueryRow("select count(*) from qr_commands where place_id=? and active=1", placeID).Scan(&qrCount); err != nil {
 		t.Fatal(err)
 	}
-	if qrCount != 32 {
-		t.Fatalf("active qr commands after restore=%d, want 32", qrCount)
+	if qrCount != 40 {
+		t.Fatalf("active qr commands after restore=%d, want 40", qrCount)
 	}
 }
 
