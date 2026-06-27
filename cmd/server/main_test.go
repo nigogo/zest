@@ -186,7 +186,7 @@ func TestAmountScanRequiresOnlyAmountAndCreatesEvent(t *testing.T) {
 		t.Fatalf("amount scan status=%d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"QR amount entry", "Subtract Lemon", "Freezer A", `id="qr-amount"`, `data-step="-10"`, `data-step="10"`} {
+	for _, want := range []string{"QR amount entry", "Subtract Lemon", "Freezer A", `id="qr-amount"`, `data-step="-1"`, `data-step="1"`, `data-step="-10"`, `data-step="-20"`, `data-step="10"`, `data-step="20"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("amount scan page missing %q: %s", want, body)
 		}
