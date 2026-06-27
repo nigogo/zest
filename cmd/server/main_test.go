@@ -12,6 +12,15 @@ import (
 	"time"
 )
 
+func loginAs(t *testing.T, a *App, userID string) []*http.Cookie {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	if err := a.createSession(rec, userID); err != nil {
+		t.Fatal(err)
+	}
+	return rec.Result().Cookies()
+}
+
 func testApp(t *testing.T) *App {
 	oldwd, _ := os.Getwd()
 	os.Chdir("../..")
@@ -74,20 +83,14 @@ func TestNegativeStockAllowed(t *testing.T) {
 		t.Fatalf("expected negative stock row: %#v", row)
 	}
 }
-func TestPasswordHashStable(t *testing.T) {
-	if hashpw("secret") == "secret" || hashpw("secret") != hashpw("secret") {
-		t.Fatal("hash should be non-plain and stable")
-	}
-}
-
 func TestSeedCreatesApprovedDevelopmentUser(t *testing.T) {
 	a := testApp(t)
-	var role, status, hash string
-	if err := a.db.QueryRow(`select m.role,m.status,u.password_hash from users u join memberships m on m.user_id=u.id where u.email=?`, "user@example.com").Scan(&role, &status, &hash); err != nil {
+	var role, status string
+	if err := a.db.QueryRow(`select m.role,m.status from users u join memberships m on m.user_id=u.id where u.email=?`, "user@example.com").Scan(&role, &status); err != nil {
 		t.Fatal(err)
 	}
-	if role != "operator" || status != "approved" || hash != hashpw("password") {
-		t.Fatalf("seed user role=%q status=%q hash matches=%v, want approved operator with simple password", role, status, hash == hashpw("password"))
+	if role != "operator" || status != "approved" {
+		t.Fatalf("seed user role=%q status=%q, want approved operator", role, status)
 	}
 }
 
@@ -97,17 +100,7 @@ func TestAdminQRCodesPageLinksToScanRoutes(t *testing.T) {
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRec := httptest.NewRecorder()
-	mux.ServeHTTP(loginRec, login)
-	if loginRec.Code != http.StatusFound {
-		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
-	}
-	cookies := loginRec.Result().Cookies()
-	if len(cookies) == 0 {
-		t.Fatal("login did not set a session cookie")
-	}
+	cookies := loginAs(t, a, "user_admin")
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/qr-codes", nil)
 	for _, cookie := range cookies {
@@ -133,16 +126,10 @@ func TestScanHomeRendersCameraScanner(t *testing.T) {
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=user%40example.com&password=password"))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRec := httptest.NewRecorder()
-	mux.ServeHTTP(loginRec, login)
-	if loginRec.Code != http.StatusFound {
-		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
-	}
+	cookies := loginAs(t, a, "user_dev")
 
 	req := httptest.NewRequest(http.MethodGet, "/scan", nil)
-	for _, cookie := range loginRec.Result().Cookies() {
+	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
 	rec := httptest.NewRecorder()
@@ -228,14 +215,7 @@ func TestSettingsPersistsLanguagePreference(t *testing.T) {
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=user%40example.com&password=password"))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRec := httptest.NewRecorder()
-	mux.ServeHTTP(loginRec, login)
-	if loginRec.Code != http.StatusFound {
-		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
-	}
-	cookies := loginRec.Result().Cookies()
+	cookies := loginAs(t, a, "user_dev")
 
 	var csrf string
 	if err := a.db.QueryRow("select csrf from sessions where user_id='user_dev'").Scan(&csrf); err != nil {
@@ -285,13 +265,10 @@ func TestPlacesPageShowsStockOverviewInsteadOfActiveLabel(t *testing.T) {
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=user%40example.com&password=password"))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRec := httptest.NewRecorder()
-	mux.ServeHTTP(loginRec, login)
+	cookies := loginAs(t, a, "user_dev")
 
 	req := httptest.NewRequest(http.MethodGet, "/places", nil)
-	for _, cookie := range loginRec.Result().Cookies() {
+	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
 	rec := httptest.NewRecorder()
@@ -320,13 +297,7 @@ func TestAdminCanSetProductColorAcrossProductMentions(t *testing.T) {
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRec := httptest.NewRecorder()
-	mux.ServeHTTP(loginRec, login)
-	if loginRec.Code != http.StatusFound {
-		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
-	}
+	cookies := loginAs(t, a, "user_admin")
 
 	var csrf string
 	if err := a.db.QueryRow("select csrf from sessions where user_id='user_admin'").Scan(&csrf); err != nil {
@@ -335,7 +306,7 @@ func TestAdminCanSetProductColorAcrossProductMentions(t *testing.T) {
 	form := "csrf=" + csrf + "&product_id=prod_0&color=%231234AB"
 	req := httptest.NewRequest(http.MethodPost, "/admin/products", strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	for _, cookie := range loginRec.Result().Cookies() {
+	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
 	rec := httptest.NewRecorder()
@@ -355,7 +326,7 @@ func TestAdminCanSetProductColorAcrossProductMentions(t *testing.T) {
 	a.db.Exec("insert into inventory_events(id,organization_id,place_id,product_id,user_id,quantity_delta,event_type) values('color1','org_dev','place_0','prod_0','user_admin',10,'add')")
 	for _, path := range []string{"/admin/products", "/places", "/events", "/events/color1/result"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
-		for _, cookie := range loginRec.Result().Cookies() {
+		for _, cookie := range cookies {
 			req.AddCookie(cookie)
 		}
 		rec := httptest.NewRecorder()
@@ -369,7 +340,7 @@ func TestAdminCanSetProductColorAcrossProductMentions(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/events", nil)
-	for _, cookie := range loginRec.Result().Cookies() {
+	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
 	rec = httptest.NewRecorder()
@@ -392,16 +363,10 @@ func TestAdminProductsPageUsesCollapsedListManagement(t *testing.T) {
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRec := httptest.NewRecorder()
-	mux.ServeHTTP(loginRec, login)
-	if loginRec.Code != http.StatusFound {
-		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
-	}
+	cookies := loginAs(t, a, "user_admin")
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/products", nil)
-	for _, cookie := range loginRec.Result().Cookies() {
+	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
 	rec := httptest.NewRecorder()
@@ -427,14 +392,7 @@ func TestAdminCanCreateRenameArchiveAndRestoreProduct(t *testing.T) {
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRec := httptest.NewRecorder()
-	mux.ServeHTTP(loginRec, login)
-	if loginRec.Code != http.StatusFound {
-		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
-	}
-	cookies := loginRec.Result().Cookies()
+	cookies := loginAs(t, a, "user_admin")
 	var csrf string
 	if err := a.db.QueryRow("select csrf from sessions where user_id='user_admin'").Scan(&csrf); err != nil {
 		t.Fatal(err)
@@ -541,16 +499,10 @@ func TestAdminPlacesPageUsesCollapsedListManagement(t *testing.T) {
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRec := httptest.NewRecorder()
-	mux.ServeHTTP(loginRec, login)
-	if loginRec.Code != http.StatusFound {
-		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
-	}
+	cookies := loginAs(t, a, "user_admin")
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/places", nil)
-	for _, cookie := range loginRec.Result().Cookies() {
+	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
 	rec := httptest.NewRecorder()
@@ -579,14 +531,7 @@ func TestAdminCanCreateRenameArchiveAndRestorePlace(t *testing.T) {
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRec := httptest.NewRecorder()
-	mux.ServeHTTP(loginRec, login)
-	if loginRec.Code != http.StatusFound {
-		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
-	}
-	cookies := loginRec.Result().Cookies()
+	cookies := loginAs(t, a, "user_admin")
 	var csrf string
 	if err := a.db.QueryRow("select csrf from sessions where user_id='user_admin'").Scan(&csrf); err != nil {
 		t.Fatal(err)
@@ -694,16 +639,10 @@ func TestAdminPlacesWarnsButAllowsArchiveWithStock(t *testing.T) {
 	mux := http.NewServeMux()
 	a.routes(mux)
 
-	login := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=admin%40example.com&password=admin123-change-me"))
-	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	loginRec := httptest.NewRecorder()
-	mux.ServeHTTP(loginRec, login)
-	if loginRec.Code != http.StatusFound {
-		t.Fatalf("login status=%d, want %d", loginRec.Code, http.StatusFound)
-	}
+	cookies := loginAs(t, a, "user_admin")
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/places", nil)
-	for _, cookie := range loginRec.Result().Cookies() {
+	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
 	rec := httptest.NewRecorder()
@@ -723,7 +662,7 @@ func TestAdminPlacesWarnsButAllowsArchiveWithStock(t *testing.T) {
 	form := "csrf=" + csrf + "&action=archive&place_id=place_0"
 	req = httptest.NewRequest(http.MethodPost, "/admin/places", strings.NewReader(form))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	for _, cookie := range loginRec.Result().Cookies() {
+	for _, cookie := range cookies {
 		req.AddCookie(cookie)
 	}
 	rec = httptest.NewRecorder()
@@ -737,5 +676,82 @@ func TestAdminPlacesWarnsButAllowsArchiveWithStock(t *testing.T) {
 	}
 	if active != 0 {
 		t.Fatalf("active after archive=%d, want 0", active)
+	}
+}
+
+func TestLoginPageUsesAuth0Button(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/login?return=/settings", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login status=%d, want %d", rec.Code, http.StatusOK)
+	}
+	if !strings.Contains(body, "/auth/login?return=%2fsettings") || !strings.Contains(body, "Log in with Auth0") {
+		t.Fatalf("login page missing Auth0 login link: %s", body)
+	}
+	if strings.Contains(body, `name="password"`) || strings.Contains(body, `href="/register"`) {
+		t.Fatalf("login page should not include password login or registration: %s", body)
+	}
+}
+
+func TestPasswordLoginUnavailable(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader("email=user%40example.com&password=password"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("password login status=%d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestAuthLoginRedirectsToAuth0Authorize(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	a.auth0 = Auth0Config{Issuer: "https://tenant.example/", ClientID: "client123", CallbackURL: "http://example.test/auth/callback"}
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/login?return=%2fsettings", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("auth login status=%d, want %d", rec.Code, http.StatusFound)
+	}
+	loc := rec.Result().Header.Get("Location")
+	if !strings.HasPrefix(loc, "https://tenant.example/authorize?") || !strings.Contains(loc, "client_id=client123") || !strings.Contains(loc, "scope=openid+profile+email") {
+		t.Fatalf("unexpected authorize redirect: %s", loc)
+	}
+	var count int
+	if err := a.db.QueryRow("select count(*) from oauth_states where return_path='/settings'").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("oauth state count=%d err=%v, want 1", count, err)
+	}
+}
+
+func TestProtectedHTMXRequestUsesHXRedirect(t *testing.T) {
+	a := testApp(t)
+	a.templates()
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/events/nope/undo", nil)
+	req.Header.Set("HX-Request", "true")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("htmx protected status=%d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+	if got := rec.Result().Header.Get("HX-Redirect"); got == "" || !strings.HasPrefix(got, "/login?return=") {
+		t.Fatalf("HX-Redirect=%q, want login redirect", got)
 	}
 }

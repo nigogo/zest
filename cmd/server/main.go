@@ -2,14 +2,19 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,6 +34,25 @@ type App struct {
 	undoWindow      time.Duration
 	tmpl            *template.Template
 	secure          bool
+	auth0           Auth0Config
+}
+
+type Auth0Config struct {
+	Domain, Issuer, ClientID, ClientSecret, CallbackURL, LogoutReturnURL string
+	AllowedEmails, AdminEmails                                           map[string]bool
+	DefaultOrgID                                                         string
+}
+
+type idTokenClaims struct {
+	Issuer        string `json:"iss"`
+	Subject       string `json:"sub"`
+	Audience      any    `json:"aud"`
+	ExpiresAt     int64  `json:"exp"`
+	IssuedAt      int64  `json:"iat"`
+	Nonce         string `json:"nonce"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+	Name          string `json:"name"`
 }
 type Ctx struct {
 	UserID, OrgID, Role, Status, CSRF string
@@ -92,6 +116,33 @@ func durationEnv(k string, d time.Duration) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+func parseEmailSet(v string) map[string]bool {
+	m := map[string]bool{}
+	for _, e := range strings.Split(v, ",") {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e != "" {
+			m[e] = true
+		}
+	}
+	return m
+}
+
+func (a *App) loadAuth0Config() {
+	domain := strings.TrimSpace(env("AUTH0_DOMAIN", ""))
+	issuer := strings.TrimRight(env("AUTH0_ISSUER", ""), "/")
+	if issuer == "" && domain != "" {
+		issuer = "https://" + strings.TrimRight(domain, "/")
+	}
+	if issuer != "" {
+		issuer += "/"
+	}
+	authBase := strings.TrimRight(issuer, "/")
+	a.auth0 = Auth0Config{Domain: domain, Issuer: issuer, ClientID: env("AUTH0_CLIENT_ID", ""), ClientSecret: env("AUTH0_CLIENT_SECRET", ""), CallbackURL: env("AUTH0_CALLBACK_URL", strings.TrimRight(a.base, "/")+"/auth/callback"), LogoutReturnURL: env("AUTH0_LOGOUT_RETURN_URL", strings.TrimRight(a.base, "/")+"/login"), AllowedEmails: parseEmailSet(env("ALLOWED_EMAILS", "")), AdminEmails: parseEmailSet(env("ADMIN_EMAILS", "")), DefaultOrgID: env("DEFAULT_ORG_ID", "org_dev")}
+	if a.auth0.Domain == "" && authBase != "" {
+		a.auth0.Domain = strings.TrimPrefix(authBase, "https://")
+	}
+}
+
 func validateProductionConfig() {
 	if env("APP_ENV", "development") != "production" {
 		return
@@ -102,16 +153,14 @@ func validateProductionConfig() {
 	if env("SESSION_SECRET", "dev-secret-change-me") == "dev-secret-change-me" {
 		log.Fatal("SESSION_SECRET must be changed when APP_ENV=production")
 	}
-	if env("SEED_ADMIN_PASSWORD", "admin123-change-me") == "admin123-change-me" {
-		log.Fatal("SEED_ADMIN_PASSWORD must be changed when APP_ENV=production")
+	for _, k := range []string{"AUTH0_DOMAIN", "AUTH0_CLIENT_ID", "AUTH0_CLIENT_SECRET"} {
+		if env(k, "") == "" {
+			log.Fatalf("%s must be set when APP_ENV=production", k)
+		}
 	}
 }
 
 func id() string { b := make([]byte, 18); rand.Read(b); return base64.RawURLEncoding.EncodeToString(b) }
-func hashpw(p string) string {
-	s := sha256.Sum256([]byte(env("SESSION_SECRET", "dev-secret-change-me") + ":" + p))
-	return base64.RawURLEncoding.EncodeToString(s[:])
-}
 
 func must(err error) {
 	if err != nil {
@@ -124,6 +173,7 @@ func main() {
 	validateProductionConfig()
 	a := &App{base: env("APP_BASE_URL", "http://localhost:8765"), addr: env("APP_ADDR", ":8765"), env: env("APP_ENV", "development"), undoWindow: durationEnv("UNDO_WINDOW_SECONDS", 20*time.Second)}
 	a.secure = a.env == "production"
+	a.loadAuth0Config()
 	for _, s := range strings.Split(env("COMMON_AMOUNTS", "10,20,40,60"), ",") {
 		n, _ := strconv.Atoi(strings.TrimSpace(s))
 		if n > 0 {
@@ -150,8 +200,18 @@ func (a *App) migrate() {
 	must(err)
 	a.ensureColumn("users", "language", "TEXT NOT NULL DEFAULT ''")
 	a.ensureColumn("users", "time_format", "TEXT NOT NULL DEFAULT 'local'")
+	a.ensureColumn("users", "provider", "TEXT NOT NULL DEFAULT 'auth0'")
+	a.ensureColumn("users", "provider_subject", "TEXT NOT NULL DEFAULT ''")
+	a.ensureColumn("users", "email_verified", "BOOLEAN NOT NULL DEFAULT FALSE")
+	a.ensureColumn("users", "updated_at", "DATETIME")
+	a.ensureAuth0Tables()
 	a.ensureColumn("products", "color", "TEXT NOT NULL DEFAULT ''")
 	a.ensurePrintQRCodesTable()
+}
+
+func (a *App) ensureAuth0Tables() {
+	_, err := a.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_provider_subject ON users(provider,provider_subject) WHERE provider_subject<>'';CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);CREATE TABLE IF NOT EXISTS oauth_states(state TEXT PRIMARY KEY,nonce TEXT NOT NULL,return_path TEXT NOT NULL,expires_at DATETIME NOT NULL);`)
+	must(err)
 }
 
 func (a *App) ensurePrintQRCodesTable() {
@@ -193,9 +253,8 @@ func (a *App) seed() {
 		return
 	}
 	a.db.Exec("insert into organizations(id,name)values(?,?)", org, "Example Company")
-	h := hashpw(env("SEED_ADMIN_PASSWORD", "admin123-change-me"))
 	u := "user_admin"
-	a.db.Exec("insert into users(id,email,name,password_hash)values(?,?,?,?)", u, env("SEED_ADMIN_EMAIL", "admin@example.com"), "Admin", h)
+	a.db.Exec("insert into users(id,email,name,password_hash,provider,provider_subject,email_verified)values(?,?,?,?,?,?,1)", u, env("SEED_ADMIN_EMAIL", "admin@example.com"), "Admin", "", "dev", "user_admin")
 	a.db.Exec("insert into memberships(id,organization_id,user_id,role,status,approved_at)values(?,?,?,?,?,CURRENT_TIMESTAMP)", "mem_admin", org, u, "admin", "approved")
 	a.ensureSeedApprovedUser(org)
 	a.db.Exec("insert into organization_invites(id,organization_id,token,active)values(?,?,?,1)", "invite_dev", org, "dev-invite-token")
@@ -231,8 +290,7 @@ func (a *App) backfillProductColors(org string) {
 func (a *App) ensureSeedApprovedUser(org string) {
 	uid := "user_dev"
 	email := env("SEED_USER_EMAIL", "user@example.com")
-	h := hashpw(env("SEED_USER_PASSWORD", "password"))
-	if _, err := a.db.Exec("insert into users(id,email,name,password_hash)values(?,?,?,?) on conflict(id) do update set email=excluded.email,name=excluded.name,password_hash=excluded.password_hash", uid, email, "Development User", h); err != nil {
+	if _, err := a.db.Exec("insert into users(id,email,name,password_hash,provider,provider_subject,email_verified)values(?,?,?,?,?,?,1) on conflict(id) do update set email=excluded.email,name=excluded.name", uid, email, "Development User", "", "dev", "user_dev"); err != nil {
 		log.Printf("seed approved user failed: %v", err)
 		return
 	}
@@ -364,7 +422,13 @@ func (a *App) ctx(r *http.Request) Ctx {
 func (a *App) need(w http.ResponseWriter, r *http.Request) (Ctx, bool) {
 	c := a.ctx(r)
 	if !c.Authed {
-		http.Redirect(w, r, "/login?return="+r.URL.RequestURI(), 302)
+		loginURL := "/login?return=" + url.QueryEscape(r.URL.RequestURI())
+		if r.Header.Get("HX-Request") == "true" {
+			w.Header().Set("HX-Redirect", loginURL)
+			w.WriteHeader(http.StatusUnauthorized)
+		} else {
+			http.Redirect(w, r, loginURL, 302)
+		}
 		return c, false
 	}
 	return c, true
@@ -431,7 +495,7 @@ var germanMessages = map[string]string{
 	"login.copy":              "Schnelle Bestandsführung für die Praxis.",
 	"login.email":             "E-Mail",
 	"login.password":          "Passwort",
-	"login.submit":            "Anmelden",
+	"login.submit":            "Mit Auth0 anmelden",
 	"login.register":          "Konto erstellen",
 	"register.tag":            "Team beitreten",
 	"register.title":          "Konto erstellen",
@@ -622,7 +686,7 @@ var englishMessages = map[string]string{
 	"login.copy":              "Fast inventory for real-world work.",
 	"login.email":             "Email",
 	"login.password":          "Password",
-	"login.submit":            "Log in",
+	"login.submit":            "Log in with Auth0",
 	"login.register":          "Create an account",
 	"register.tag":            "Join your team",
 	"register.title":          "Create account",
@@ -963,6 +1027,8 @@ func (a *App) routes(m *http.ServeMux) {
 	})))
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/places", 302) })
 	m.HandleFunc("/login", a.login)
+	m.HandleFunc("/auth/login", a.authLogin)
+	m.HandleFunc("/auth/callback", a.authCallback)
 	m.HandleFunc("/register", a.register)
 	m.HandleFunc("/logout", a.logout)
 	m.HandleFunc("/org/join/", a.join)
@@ -986,42 +1052,91 @@ func (a *App) routes(m *http.ServeMux) {
 }
 
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "GET" {
-		a.render(w, r, "login", r.URL.Query().Get("return"))
+	if r.Method != "GET" {
+		http.Error(w, "password login is no longer available", http.StatusMethodNotAllowed)
 		return
 	}
-	email, pw := r.FormValue("email"), r.FormValue("password")
-	var uid, hash string
-	if a.db.QueryRow("select id,password_hash from users where email=?", email).Scan(&uid, &hash) != nil || hashpw(pw) != hash {
-		a.render(w, r, "login", "bad login")
-		return
-	}
-	tok, csrf := id(), id()
-	a.db.Exec("insert into sessions(token,user_id,csrf,expires_at)values(?,?,?,datetime('now','+7 days'))", tok, uid, csrf)
-	http.SetCookie(w, &http.Cookie{Name: "sid", Value: tok, Path: "/", HttpOnly: true, Secure: a.secure, SameSite: http.SameSiteLaxMode})
-	ret := r.FormValue("return")
+	a.render(w, r, "login", sanitizeReturnPath(r.URL.Query().Get("return")))
+}
+
+func sanitizeReturnPath(ret string) string {
 	if ret == "" {
-		ret = "/places"
+		return "/places"
 	}
-	http.Redirect(w, r, ret, 302)
+	if !strings.HasPrefix(ret, "/") || strings.HasPrefix(ret, "//") {
+		return "/places"
+	}
+	if u, err := url.Parse(ret); err != nil || u.IsAbs() || u.Host != "" {
+		return "/places"
+	}
+	return ret
+}
+
+func (a *App) createSession(w http.ResponseWriter, uid string) error {
+	tok, csrf := id(), id()
+	expires := time.Now().Add(7 * 24 * time.Hour)
+	if _, err := a.db.Exec("insert into sessions(token,user_id,csrf,expires_at)values(?,?,?,?)", tok, uid, csrf, expires.UTC().Format("2006-01-02 15:04:05")); err != nil {
+		return err
+	}
+	http.SetCookie(w, &http.Cookie{Name: "sid", Value: tok, Path: "/", HttpOnly: true, Secure: a.secure, SameSite: http.SameSiteLaxMode, Expires: expires})
+	return nil
 }
 
 func (a *App) register(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "GET" {
-		a.render(w, r, "register", nil)
+	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+func (a *App) authLogin(w http.ResponseWriter, r *http.Request) {
+	if a.auth0.ClientID == "" || a.auth0.Issuer == "" {
+		http.Error(w, "auth0 is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	h := hashpw(r.FormValue("password"))
-	uid := id()
-	_, err := a.db.Exec("insert into users(id,email,name,password_hash)values(?,?,?,?)", uid, r.FormValue("email"), r.FormValue("name"), h)
+	state, nonce := id(), id()
+	ret := sanitizeReturnPath(r.URL.Query().Get("return"))
+	_, err := a.db.Exec("insert into oauth_states(state,nonce,return_path,expires_at)values(?,?,?,datetime('now','+10 minutes'))", state, nonce, ret)
 	if err != nil {
-		a.render(w, r, "register", err.Error())
+		http.Error(w, "could not start login", 500)
 		return
 	}
-	tok, csrf := id(), id()
-	a.db.Exec("insert into sessions(token,user_id,csrf,expires_at)values(?,?,?,datetime('now','+7 days'))", tok, uid, csrf)
-	http.SetCookie(w, &http.Cookie{Name: "sid", Value: tok, Path: "/", HttpOnly: true, Secure: a.secure, SameSite: http.SameSiteLaxMode})
-	http.Redirect(w, r, "/places", 302)
+	u, _ := url.Parse(strings.TrimRight(a.auth0.Issuer, "/") + "/authorize")
+	q := u.Query()
+	q.Set("response_type", "code")
+	q.Set("client_id", a.auth0.ClientID)
+	q.Set("redirect_uri", a.auth0.CallbackURL)
+	q.Set("scope", "openid profile email")
+	q.Set("state", state)
+	q.Set("nonce", nonce)
+	u.RawQuery = q.Encode()
+	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+func (a *App) authCallback(w http.ResponseWriter, r *http.Request) {
+	if errMsg := r.URL.Query().Get("error"); errMsg != "" {
+		a.render(w, r, "error", map[string]string{"Message": "Auth0 login failed: " + errMsg})
+		return
+	}
+	state, code := r.URL.Query().Get("state"), r.URL.Query().Get("code")
+	var nonce, ret string
+	if state == "" || code == "" || a.db.QueryRow("select nonce,return_path from oauth_states where state=? and expires_at>datetime('now')", state).Scan(&nonce, &ret) != nil {
+		http.Error(w, "invalid oauth state", http.StatusForbidden)
+		return
+	}
+	a.db.Exec("delete from oauth_states where state=?", state)
+	claims, err := a.exchangeAndValidateIDToken(r.Context(), code, nonce)
+	if err != nil {
+		http.Error(w, "invalid id token: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+	uid, err := a.userForClaims(claims)
+	if err != nil {
+		a.render(w, r, "error", map[string]string{"Message": err.Error()})
+		return
+	}
+	if err := a.createSession(w, uid); err != nil {
+		http.Error(w, "could not create session", 500)
+		return
+	}
+	http.Redirect(w, r, sanitizeReturnPath(ret), http.StatusFound)
 }
 
 func (a *App) logout(w http.ResponseWriter, r *http.Request) {
@@ -1032,7 +1147,187 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 	if ck, err := r.Cookie("sid"); err == nil {
 		a.db.Exec("delete from sessions where token=?", ck.Value)
 	}
-	http.Redirect(w, r, "/login", 302)
+	http.SetCookie(w, &http.Cookie{Name: "sid", Value: "", Path: "/", HttpOnly: true, Secure: a.secure, SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(0, 0)})
+	if a.auth0.Issuer != "" && a.auth0.ClientID != "" && a.auth0.LogoutReturnURL != "" {
+		u, _ := url.Parse(strings.TrimRight(a.auth0.Issuer, "/") + "/v2/logout")
+		q := u.Query()
+		q.Set("client_id", a.auth0.ClientID)
+		q.Set("returnTo", a.auth0.LogoutReturnURL)
+		u.RawQuery = q.Encode()
+		http.Redirect(w, r, u.String(), http.StatusFound)
+		return
+	}
+	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+type tokenResponse struct {
+	IDToken string `json:"id_token"`
+}
+type jwksDoc struct {
+	Keys []jwkKey `json:"keys"`
+}
+type jwkKey struct{ Kid, Kty, Alg, Use, N, E string }
+
+func (a *App) exchangeAndValidateIDToken(ctx context.Context, code, nonce string) (idTokenClaims, error) {
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("client_id", a.auth0.ClientID)
+	form.Set("client_secret", a.auth0.ClientSecret)
+	form.Set("code", code)
+	form.Set("redirect_uri", a.auth0.CallbackURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(a.auth0.Issuer, "/")+"/oauth/token", strings.NewReader(form.Encode()))
+	if err != nil {
+		return idTokenClaims{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return idTokenClaims{}, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode/100 != 2 {
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		return idTokenClaims{}, fmt.Errorf("token endpoint status %d: %s", res.StatusCode, string(b))
+	}
+	var tr tokenResponse
+	if err := json.NewDecoder(res.Body).Decode(&tr); err != nil {
+		return idTokenClaims{}, err
+	}
+	return a.validateIDToken(ctx, tr.IDToken, nonce)
+}
+
+func (a *App) validateIDToken(ctx context.Context, raw, nonce string) (idTokenClaims, error) {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return idTokenClaims{}, fmt.Errorf("malformed jwt")
+	}
+	headerJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return idTokenClaims{}, err
+	}
+	var header struct{ Alg, Kid string }
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		return idTokenClaims{}, err
+	}
+	if header.Alg != "RS256" {
+		return idTokenClaims{}, fmt.Errorf("unsupported alg")
+	}
+	key, err := a.jwksKey(ctx, header.Kid)
+	if err != nil {
+		return idTokenClaims{}, err
+	}
+	h := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return idTokenClaims{}, err
+	}
+	if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, h[:], sig); err != nil {
+		return idTokenClaims{}, err
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return idTokenClaims{}, err
+	}
+	var claims idTokenClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return idTokenClaims{}, err
+	}
+	if claims.Issuer != a.auth0.Issuer {
+		return claims, fmt.Errorf("bad issuer")
+	}
+	if !audContains(claims.Audience, a.auth0.ClientID) {
+		return claims, fmt.Errorf("bad audience")
+	}
+	if claims.ExpiresAt <= time.Now().Unix() {
+		return claims, fmt.Errorf("token expired")
+	}
+	if claims.Nonce != nonce {
+		return claims, fmt.Errorf("bad nonce")
+	}
+	if claims.Subject == "" {
+		return claims, fmt.Errorf("missing subject")
+	}
+	return claims, nil
+}
+
+func audContains(aud any, want string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == want
+	case []any:
+		for _, x := range v {
+			if s, ok := x.(string); ok && s == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (a *App) jwksKey(ctx context.Context, kid string) (*rsa.PublicKey, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(a.auth0.Issuer, "/")+"/.well-known/jwks.json", nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	var doc jwksDoc
+	if err := json.NewDecoder(res.Body).Decode(&doc); err != nil {
+		return nil, err
+	}
+	for _, k := range doc.Keys {
+		if k.Kid != kid || k.Kty != "RSA" {
+			continue
+		}
+		nb, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil {
+			return nil, err
+		}
+		eb, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil {
+			return nil, err
+		}
+		e := 0
+		for _, b := range eb {
+			e = e*256 + int(b)
+		}
+		return &rsa.PublicKey{N: new(big.Int).SetBytes(nb), E: e}, nil
+	}
+	return nil, fmt.Errorf("jwks key not found")
+}
+
+func (a *App) userForClaims(claims idTokenClaims) (string, error) {
+	email := strings.ToLower(strings.TrimSpace(claims.Email))
+	var uid string
+	if a.db.QueryRow("select id from users where provider='auth0' and provider_subject=?", claims.Subject).Scan(&uid) == nil {
+		a.db.Exec("update users set email=?,email_verified=?,name=?,updated_at=CURRENT_TIMESTAMP where id=?", email, claims.EmailVerified, claims.Name, uid)
+		var approved int
+		a.db.QueryRow("select count(*) from memberships where user_id=? and status='approved'", uid).Scan(&approved)
+		if approved == 0 {
+			return "", fmt.Errorf("This user is not approved for access")
+		}
+		return uid, nil
+	}
+	if email == "" {
+		return "", fmt.Errorf("Auth0 account has no email")
+	}
+	if !claims.EmailVerified {
+		return "", fmt.Errorf("Email must be verified before access is allowed")
+	}
+	if !a.auth0.AllowedEmails[email] && !a.auth0.AdminEmails[email] {
+		return "", fmt.Errorf("This email is not allowed to access Zest")
+	}
+	uid = id()
+	_, err := a.db.Exec("insert into users(id,email,name,password_hash,provider,provider_subject,email_verified,updated_at)values(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)", uid, email, claims.Name, "", "auth0", claims.Subject, claims.EmailVerified)
+	if err != nil {
+		return "", err
+	}
+	role := "operator"
+	if a.auth0.AdminEmails[email] {
+		role = "admin"
+	}
+	_, err = a.db.Exec("insert or ignore into memberships(id,organization_id,user_id,role,status,approved_at)values(?,?,?,?,?,CURRENT_TIMESTAMP)", id(), a.auth0.DefaultOrgID, uid, role, "approved")
+	return uid, err
 }
 
 func (a *App) join(w http.ResponseWriter, r *http.Request) {
@@ -1790,8 +2085,8 @@ var _ = context.Background
 
 const tpl = `{{define "layout"}}<!doctype html><html lang="{{.Ctx.Lang}}"><head><title>Zest · {{.Title}}</title><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/static/app.css"><script src="https://unpkg.com/htmx.org@1.9.12"></script><script src="https://unpkg.com/hyperscript.org@0.9.12"></script><script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>{{if eq .Title "scan"}}<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script><script src="/static/qr_scanner.js"></script>{{end}}</head><body><header class="mobile-header"><div><a class="wordmark" href="/places"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</a></div><nav class="header-nav" aria-label="Primary"><a class="button ghost icon-button" href="/places" title="{{t .Ctx "nav.places"}}"><i data-lucide="package" aria-hidden="true"></i></a><a class="button ghost icon-button" href="/events" title="{{t .Ctx "nav.events"}}"><i data-lucide="clipboard-list" aria-hidden="true"></i></a><a class="button ghost icon-button" href="/settings" title="{{t .Ctx "nav.settings"}}"><i data-lucide="settings" aria-hidden="true"></i></a>{{if eq .Ctx.Role "admin"}}<a class="button ghost icon-button" href="/admin" title="{{t .Ctx "nav.admin"}}"><i data-lucide="shield" aria-hidden="true"></i></a>{{end}}{{if .Ctx.Authed}}<form method="post" action="/logout">{{csrf .Ctx}}<button class="ghost icon-button" title="{{t .Ctx "nav.logout"}}"><i data-lucide="log-out" aria-hidden="true"></i></button></form>{{end}}</nav></header><main class="app-main {{if .Ctx.AdminArea}}admin-area{{end}} {{if eq .Title "scan"}}scan-main{{end}}">{{if .Ctx.AdminArea}}<div class="admin-shell"><nav class="admin-nav">{{template "adminNav" .}}</nav><section class="admin-content">{{template "body" .}}</section></div>{{else}}{{template "body" .}}{{end}}</main>{{if and .Ctx.Authed (not .Ctx.AdminArea) (ne .Title "scan")}}<nav class="bottom-action-bar" aria-label="{{t .Ctx "nav.scan"}}"><a class="button primary" href="/scan"><i data-lucide="scan-line" aria-hidden="true"></i>{{t .Ctx "nav.scan"}}</a><a class="button secondary" href="/manual"><i data-lucide="pencil-line" aria-hidden="true"></i>{{t .Ctx "nav.manual"}}</a></nav>{{end}}<script>window.lucide&&lucide.createIcons()</script></body></html>{{end}}
 {{define "adminNav"}}<a href="/admin">{{t .Ctx "admin.title"}}</a><a href="/admin/memberships">{{t .Ctx "admin.approvals"}}</a><a href="/admin/places">{{t .Ctx "places.title"}}</a><a href="/admin/products">{{t .Ctx "admin.products"}}</a><a href="/admin/qr-codes">{{t .Ctx "qr.matrices"}}</a><a href="/admin/print-qr-codes">{{t .Ctx "printqr.title"}}</a><a href="/admin/events">{{t .Ctx "nav.events"}}</a><a href="/admin/reports">{{t .Ctx "admin.reports"}}</a>{{end}}
-{{define "login"}}{{template "layout" .}}{{end}}{{define "body"}}{{if eq .Title "login"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">{{t .Ctx "login.tag"}}</p><h1>{{t .Ctx "login.title"}}</h1><p class="muted">{{t .Ctx "login.copy"}}</p><form method="post"><input type="hidden" name="return" value="{{.Data}}"><label>{{t .Ctx "login.email"}}<input name="email" type="email" autocomplete="email" required></label><label>{{t .Ctx "login.password"}}<input name="password" type="password" autocomplete="current-password" required></label><button class="primary full">{{t .Ctx "login.submit"}}</button></form><p><a href="/register">{{t .Ctx "login.register"}}</a></p></div></section>{{else}}{{template "body2" .}}{{end}}{{end}}
-{{define "body2"}}{{if eq .Title "register"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">{{t .Ctx "register.tag"}}</p><h1>{{t .Ctx "register.title"}}</h1><form method="post"><label>{{t .Ctx "register.name"}}<input name="name" autocomplete="name" required></label><label>{{t .Ctx "login.email"}}<input name="email" type="email" autocomplete="email" required></label><label>{{t .Ctx "login.password"}}<input name="password" type="password" autocomplete="new-password" required></label><button class="primary full">{{t .Ctx "register.submit"}}</button></form></div></section>{{else if eq .Title "waiting"}}<section class="card status-info"><p class="eyebrow">{{t .Ctx "waiting.eyebrow"}}</p><h1>{{t .Ctx "waiting.title"}}</h1><p>{{t .Ctx "waiting.added"}}</p><p>{{t .Ctx "waiting.copy"}}</p><a class="button secondary" href="/logout">{{t .Ctx "waiting.switch"}}</a></section>{{else if eq .Title "error"}}<section class="card status-danger"><p class="eyebrow">{{t .Ctx "error.eyebrow"}}</p><h1>{{index .Data "Message"}}</h1><div class="row mt"><a class="button primary" href="/places">{{t .Ctx "error.home"}}</a><a class="button secondary" href="/login">{{t .Ctx "error.login"}}</a></div></section>{{else if eq .Title "places"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "places.eyebrow"}}</p><h1>{{t .Ctx "places.title"}}</h1><p class="muted">{{t .Ctx "places.copy"}}</p></div><a class="button secondary" href="/dev/qr-codes">{{t .Ctx "places.devqr"}}</a></div><div class="grid">{{range .Data}}<a class="place-card" href="/places/{{.Token}}"><div class="place-card-header"><span class="place-icon" aria-hidden="true"><i data-lucide="package"></i></span><h2>{{.Name}}</h2></div><dl class="place-overview">{{range .Overview}}<div class="place-overview-item {{productClass .Name}}" style="{{productStyle .Color}}"><dt>{{.Name}}</dt><dd><strong>{{.Qty}}</strong> {{.Unit}}</dd></div>{{else}}<div class="place-overview-empty">{{t $.Ctx "places.cardcopy"}}</div>{{end}}</dl></a>{{else}}<div class="empty-state">{{t .Ctx "places.empty"}}</div>{{end}}</div>{{else if eq .Title "place"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "place.eyebrow"}}</p><h1>{{index .Data "Name"}}</h1><p class="muted">{{t .Ctx "place.stock"}}</p></div>{{if eq .Ctx.Role "admin"}}<span class="pill">{{t .Ctx "place.approved"}}</span>{{end}}</div><div class="grid two">{{range index .Data "Stocks"}}<article class="product-card {{productClass .Name}} {{if lt .Qty 0}}negative{{end}}" style="{{productStyle .Color}}"><span class="product-badge {{productClass .Name}}" style="{{productStyle .Color}}">{{.Name}}</span><div class="stock-qty">{{.Qty}}</div><p class="muted">{{unit $.Ctx .Unit}} {{t $.Ctx "place.here"}}</p>{{if lt .Qty 0}}<p class="status-banner status-warning">{{t $.Ctx "place.negative"}}</p>{{else if eq .Qty 0}}<p class="muted">{{t $.Ctx "place.zero"}}</p>{{end}}</article>{{else}}<div class="empty-state">{{t .Ctx "products.empty"}}</div>{{end}}</div><section class="section-header"><h2>{{t .Ctx "place.recent"}}</h2><a href="/events">{{t .Ctx "place.viewall"}}</a></section><div class="empty-state">{{t .Ctx "place.recentempty"}}</div><section class="card mt"><h2>{{t .Ctx "nav.manual"}}</h2><p class="muted">{{t .Ctx "manual.copy"}}</p><a class="button secondary full" href="/manual?place_token={{index .Data "Token"}}">{{t .Ctx "nav.manual"}}</a></section>{{else if eq .Title "scan"}}<section class="scanner-page"><div class="page-header"><div><p class="eyebrow">{{t .Ctx "nav.scan"}}</p><h1>{{t .Ctx "scan.title"}}</h1><p class="muted">{{t .Ctx "scan.copy"}}</p></div><a class="button ghost icon-button" href="/places" title="{{t .Ctx "scan.cancel"}}"><i data-lucide="x" aria-hidden="true"></i></a></div><div class="scanner-card"><video id="qr-video" class="scanner-video" autoplay muted playsinline aria-label="{{t .Ctx "scan.title"}}"></video><div class="scanner-frame" aria-hidden="true"></div><div class="scanner-controls"><p id="scan-status" class="status-banner status-info">{{t .Ctx "scan.starting"}}</p><div class="scanner-actions"><button id="camera-start" class="secondary" type="button">{{t .Ctx "scan.start_button"}}</button></div></div></div><script>(()=>{function sizeScanPage(){document.documentElement.style.setProperty("--scan-vh",((window.visualViewport&&window.visualViewport.height)||window.innerHeight)+"px");}sizeScanPage();window.visualViewport&&window.visualViewport.addEventListener("resize",sizeScanPage);window.addEventListener("orientationchange",sizeScanPage);function pathFrom(raw){try{const u=new URL(raw,window.location.href);if(u.origin!==window.location.origin)return "";if(!u.pathname.startsWith("/scan/")||u.pathname==="/scan/")return "";return u.pathname+u.search+u.hash;}catch(e){return "";}}function openScan(raw){const path=pathFrom(raw);if(!path)return false;window.location.assign(path);return true;}window.ZestQRScanner&&window.ZestQRScanner.create({video:document.getElementById("qr-video"),status:document.getElementById("scan-status"),startButton:document.getElementById("camera-start"),stopButton:document.querySelector('.scanner-page a[href="/places"]'),messages:{starting:{{printf "%q" (t .Ctx "scan.starting")}},scanning:{{printf "%q" (t .Ctx "scan.ready")}},found:{{printf "%q" (t .Ctx "scan.found")}},unavailable:{{printf "%q" (t .Ctx "scan.unavailable")}},denied:{{printf "%q" (t .Ctx "scan.denied")}},none:{{printf "%q" (t .Ctx "scan.none")}},failed:{{printf "%q" (t .Ctx "scan.failed")}},insecure:{{printf "%q" (t .Ctx "scan.insecure")}}},onScanSuccess:function(result){if(!openScan(result)){document.getElementById("scan-status").textContent={{printf "%q" (t .Ctx "error.invalid_qr")}};}},onScanError:function(){}});})();</script></section>{{else if eq .Title "events"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "events.eyebrow"}}</p><h1>{{t .Ctx "events.title"}}</h1></div></div><div class="stack">{{range .Data}}<article class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}} {{if eq .Type "reversal"}}reversal{{end}}">{{eventSign .Qty .Type}}</div><div><strong class="event-product-line"><span class="product-badge {{productClass .Product}}" style="{{productStyle .Color}}">{{.Product}}</span></strong><p class="event-amount-line">{{eventAmountText $.Ctx .Type .Qty .Unit}}</p><p class="muted event-meta"><span>{{.Place}} · {{.User}}</span><span class="event-time">{{formatTime $.Ctx .Time}}</span></p><span class="pill">{{.Type}}</span></div></article>{{else}}<div class="empty-state">{{t .Ctx "events.empty"}}</div>{{end}}</div>{{else if eq .Title "manual"}}<section class="card manual-flow"><p class="eyebrow">{{t .Ctx "manual.eyebrow"}}</p><h1>{{t .Ctx "manual.title"}}</h1><p class="muted">{{t .Ctx "manual.copy"}}</p><form method="post" class="manual-form mt">{{csrf .Ctx}}<label>{{t .Ctx "manual.place"}}<select name="place_id" required>{{range .Data.Places}}<option value="{{.ID}}" {{if eq $.Data.SelectedPlace .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></label><label>{{t .Ctx "manual.product"}}<select name="product_id" required>{{range .Data.Products}}<option value="{{.ID}}">{{.Name}} · {{unit $.Ctx .Unit}}</option>{{end}}</select></label><label>{{t .Ctx "manual.amount"}}<input name="amount" type="number" inputmode="numeric" min="1" value="{{with index .Data.Amounts 0}}{{.}}{{else}}1{{end}}" required></label><div class="amount-chips">{{range .Data.Amounts}}<button class="secondary" type="button" onclick="this.form.amount.value='{{.}}'">{{.}}</button>{{end}}</div><div class="manual-actions"><button class="primary" name="action" value="add"><i data-lucide="plus" aria-hidden="true"></i>{{t .Ctx "manual.add"}}</button><button class="secondary" name="action" value="subtract"><i data-lucide="minus" aria-hidden="true"></i>{{t .Ctx "manual.subtract"}}</button></div></form></section>{{else if eq .Title "admin"}}<p class="eyebrow">{{t .Ctx "admin.backoffice"}}</p><h1>{{t .Ctx "admin.title"}}</h1><div class="admin-grid"><div class="metric-card"><span>{{t .Ctx "admin.total"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.today"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.approvals"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.negative"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.activeplaces"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.activeproducts"}}</span><strong>—</strong></div></div><div class="card mt"><h2>{{t .Ctx "admin.reports_settings"}}</h2><p class="muted">{{t .Ctx "admin.coming_soon"}}</p></div>{{else if eq .Title "members"}}<h1>{{t .Ctx "admin.approvals"}}</h1><div class="table-card"><table><thead><tr><th>{{t .Ctx "members.user"}}</th><th>{{t .Ctx "members.status"}}</th><th>{{t .Ctx "members.actions"}}</th></tr></thead><tbody>{{range .Data}}<tr><td><strong>{{.Name}}</strong><br><span class="muted">{{.Email}}</span></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/memberships/{{.ID}}/approve">{{csrf $.Ctx}}<button>{{t $.Ctx "members.approve"}}</button></form><form method="post" action="/admin/memberships/{{.ID}}/reject">{{csrf $.Ctx}}<button class="secondary">{{t $.Ctx "members.reject"}}</button></form></td></tr>{{else}}<tr><td colspan="3">{{t .Ctx "members.none"}}</td></tr>{{end}}</tbody></table></div>{{else if eq .Title "products"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "admin.products"}}</p><h1>{{t .Ctx "admin.products"}}</h1><p class="muted">{{t .Ctx "products.copy"}}</p></div><details class="new-product-menu"><summary class="button primary">{{t .Ctx "products.add"}}</summary><form class="product-management-form card" method="post" action="/admin/products">{{csrf .Ctx}}<input type="hidden" name="action" value="create"><h2>{{t .Ctx "products.add"}}</h2><div class="product-form-grid"><label>{{t .Ctx "products.name"}}<input name="name" required placeholder="Lemon"></label><label>{{t .Ctx "products.code"}}<input name="code" required placeholder="LEMON"></label><label>{{t .Ctx "products.unit"}}<input name="unit" value="units" required></label><label>{{t .Ctx "products.color"}}<input type="color" name="color" value="#F5B700"></label><button class="primary">{{t .Ctx "products.add"}}</button></div></form></details></div><div class="product-list" role="list">{{range .Data}}<details class="product-list-item {{if not .Active}}is-archived{{end}}" style="{{productStyle .Color}}" role="listitem"><summary><span class="product-badge {{productClass .Name}}" style="{{productStyle .Color}}">{{.Name}}</span><span class="muted product-list-meta">{{.Code}} · {{.Unit}}</span><span class="pill">{{if .Active}}{{t $.Ctx "products.active"}}{{else}}{{t $.Ctx "products.archived"}}{{end}}</span></summary><div class="product-editor"><form id="save-{{.ID}}" class="product-management-form" method="post" action="/admin/products">{{csrf $.Ctx}}<input type="hidden" name="action" value="save"><input type="hidden" name="product_id" value="{{.ID}}"><div class="product-form-grid"><label>{{t $.Ctx "products.name"}}<input name="name" value="{{.Name}}" required></label><label>{{t $.Ctx "products.code"}}<input name="code" value="{{.Code}}" required></label><label>{{t $.Ctx "products.unit"}}<input name="unit" value="{{.Unit}}" required></label><label>{{t $.Ctx "products.color"}}<input type="color" name="color" value="{{.Color}}"></label><button class="secondary">{{t $.Ctx "products.save"}}</button></div></form><form method="post" action="/admin/products">{{csrf $.Ctx}}<input type="hidden" name="product_id" value="{{.ID}}"><input type="hidden" name="action" value="{{if .Active}}archive{{else}}restore{{end}}"><button class="{{if .Active}}danger{{else}}secondary{{end}}">{{if .Active}}{{t $.Ctx "products.archive"}}{{else}}{{t $.Ctx "products.restore"}}{{end}}</button></form></div></details>{{else}}<div class="empty-state">{{t .Ctx "products.empty"}}</div>{{end}}</div>{{else if eq .Title "places_admin"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "places.title"}}</p><h1>{{t .Ctx "places.title"}}</h1><p class="muted">{{t .Ctx "places.admin_copy"}}</p></div><details class="new-product-menu"><summary class="button primary">{{t .Ctx "places.add"}}</summary><form class="product-management-form card" method="post" action="/admin/places">{{csrf .Ctx}}<input type="hidden" name="action" value="create"><h2>{{t .Ctx "places.add"}}</h2><div class="product-form-grid"><label>{{t .Ctx "places.name"}}<input name="name" required placeholder="Warehouse"></label><button class="primary">{{t .Ctx "places.add"}}</button></div></form></details></div><div class="product-list" role="list">{{range .Data}}<details class="product-list-item {{if not .Active}}is-archived{{end}}" role="listitem"><summary><span class="admin-place-list-name"><span class="place-icon small" aria-hidden="true"><i data-lucide="package"></i></span><span>{{.Name}}</span></span><span class="pill">{{if .Active}}{{t $.Ctx "places.active"}}{{else}}{{t $.Ctx "places.archived"}}{{end}}</span></summary><div class="product-editor"><form id="save-{{.ID}}" class="product-management-form" method="post" action="/admin/places">{{csrf $.Ctx}}<input type="hidden" name="action" value="save"><input type="hidden" name="place_id" value="{{.ID}}"><div class="product-form-grid"><label>{{t $.Ctx "places.name"}}<input name="name" value="{{.Name}}" required></label><button class="secondary">{{t $.Ctx "places.save"}}</button></div></form><form method="post" action="/admin/places" {{if and .Active .HasStock}}onsubmit="return confirm('{{t $.Ctx "places.archive_confirm"}}')"{{end}}>{{csrf $.Ctx}}<input type="hidden" name="place_id" value="{{.ID}}"><input type="hidden" name="action" value="{{if .Active}}archive{{else}}restore{{end}}"><button class="{{if .Active}}danger{{else}}secondary{{end}}">{{if .Active}}{{t $.Ctx "places.archive"}}{{else}}{{t $.Ctx "places.restore"}}{{end}}</button></form></div></details>{{else}}<div class="empty-state">{{t .Ctx "places.empty"}}</div>{{end}}</div>{{else if eq .Title "printqr"}}<div class="page-header no-print"><div><p class="eyebrow">{{t .Ctx "qr.matrices"}}</p><h1>{{t .Ctx "printqr.title"}}</h1><p class="muted">{{t .Ctx "printqr.copy"}}</p></div><button class="secondary" onclick="window.print()">{{t .Ctx "printqr.print"}}</button></div><section class="card no-print"><h2>{{t .Ctx "printqr.add"}}</h2><form method="post" class="printqr-form" data-printqr-form>{{csrf .Ctx}}<input type="hidden" name="action" value="create"><label data-printqr-field="kind">{{t .Ctx "printqr.kind"}}<select name="kind" data-printqr-kind><option value="home">{{t .Ctx "printqr.open_home"}}</option><option value="place">{{t .Ctx "qr.open_place"}}</option><option value="command">{{t .Ctx "printqr.command"}}</option></select></label><label data-printqr-field="place">{{t .Ctx "manual.place"}}<select name="place_id">{{range .Data.Places}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label><label data-printqr-field="product">{{t .Ctx "manual.product"}}<select name="product_id">{{range .Data.Products}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label><label data-printqr-field="amount">{{t .Ctx "manual.amount"}}<input name="amount" type="number" min="1" value="{{with index .Data.Amounts 0}}{{.}}{{else}}1{{end}}"></label><label data-printqr-field="action">{{t .Ctx "nav.events"}}<select name="command_action"><option value="add">{{t .Ctx "manual.add"}}</option><option value="subtract">{{t .Ctx "manual.subtract"}}</option></select></label><label data-printqr-field="label">{{t .Ctx "printqr.label"}}<input name="label" placeholder="{{t .Ctx "printqr.placeholder"}}"></label><div class="printqr-submit-row"><button class="primary">{{t .Ctx "printqr.add"}}</button></div></form><script>document.querySelectorAll('[data-printqr-form]').forEach(function(form){var kind=form.querySelector('[data-printqr-kind]');var fields={place:form.querySelector('[data-printqr-field="place"]'),product:form.querySelector('[data-printqr-field="product"]'),amount:form.querySelector('[data-printqr-field="amount"]'),action:form.querySelector('[data-printqr-field="action"]')};function setField(name,show){var field=fields[name];if(!field)return;field.classList.toggle('is-hidden',!show);field.querySelectorAll('input,select').forEach(function(control){control.disabled=!show;});}function update(){var value=kind.value;setField('place',value==='place'||value==='command');setField('product',value==='command');setField('amount',value==='command');setField('action',value==='command');}kind.addEventListener('change',update);update();});</script></section><section class="qr-page printqr-page"><div class="row print-only"><div><span class="wordmark"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</span><p class="eyebrow">{{t .Ctx "printqr.title"}}</p></div></div><div class="qrgrid printable-matrix printqr-matrix">{{range .Data.Codes}}<div class="qr {{productClass .Product}}" style="{{productStyle .Color}}"><img alt="QR code for {{.Label}}" src="{{.Img}}"><strong>{{.Label}}</strong>{{if eq .Kind "command"}}<small>{{.Place}}<br>{{.ActionLabel}} {{.Amount}} {{.Product}}</small>{{else if eq .Kind "place"}}<small>{{.Place}}</small>{{else}}<small>{{.Target}}</small>{{end}}<form class="no-print" method="post">{{csrf $.Ctx}}<input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{{.ID}}"><button class="danger">{{t $.Ctx "printqr.delete"}}</button></form></div>{{else}}<div class="empty-state no-print">{{t .Ctx "printqr.empty"}}</div>{{end}}</div></section>{{else if eq .Title "qr"}}<section class="qr-page"><div class="row"><div><span class="wordmark"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</span><p class="eyebrow">{{t .Ctx "qr.matrix"}} · Example Company</p><h1>{{t .Ctx "qr.print_matrix"}}</h1><p class="muted">{{t .Ctx "qr.generated"}}</p></div><button class="secondary no-print" onclick="window.print()">{{t .Ctx "qr.print"}}</button></div><div class="qr-section"><h2>{{t .Ctx "action.add_section"}}</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "add"}}<div class="qr {{productClass .Label}}" style="{{productStyle .Color}}"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>{{t .Ctx "action.subtract_section"}}</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "subtract"}}<div class="qr {{productClass .Label}}" style="{{productStyle .Color}}"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>{{t .Ctx "qr.backup"}}</h2><p class="muted">{{t .Ctx "qr.backup_copy"}}</p>{{with index .Data 0}}<a class="qr" href="{{.PlaceURL}}"><img alt="{{t $.Ctx "qr.open_place"}}" src="{{.PlaceImg}}"><small>{{t $.Ctx "qr.open_place"}}</small></a>{{end}}</div></section>{{else if eq .Title "devqr"}}<section class="qr-page"><div class="row"><div><p class="eyebrow">{{t .Ctx "devqr.matrix"}}</p><h1>{{t .Ctx "devqr.title"}}</h1><p class="muted">{{t .Ctx "devqr.copy"}}</p></div><button class="secondary no-print" onclick="window.print()">{{t .Ctx "qr.print_matrix"}}</button></div><div class="qrgrid printable-matrix">{{range .Data}}<a class="qr {{productClass .Product}}" style="{{productStyle .Color}}" href="{{.Href}}"><img alt="QR code for {{.ActionLabel}} {{.Amount}} {{.Product}} at {{.Place}}" src="{{.Img}}"><small>{{.Place}}<br>{{.ActionLabel}} {{.Amount}} {{.Product}}</small></a>{{end}}</div></section>{{else if eq .Title "settings"}}<section class="card"><p class="eyebrow">{{t .Ctx "nav.settings"}}</p><h1>{{t .Ctx "settings.title"}}</h1><p class="muted">{{t .Ctx "settings.copy"}}</p>{{if index .Data "Saved"}}<p class="status-banner status-success">{{t .Ctx "settings.saved"}}</p>{{end}}<form method="post" class="mt">{{csrf .Ctx}}<label>{{t .Ctx "settings.language"}}<select name="language"><option value="" {{if eq .Ctx.LangPref ""}}selected{{end}}>{{t .Ctx "settings.device"}}</option><option value="en" {{if eq .Ctx.LangPref "en"}}selected{{end}}>{{t .Ctx "settings.english"}}</option><option value="de" {{if eq .Ctx.LangPref "de"}}selected{{end}}>{{t .Ctx "settings.german"}}</option></select></label><label>{{t .Ctx "settings.time_format"}}<select name="time_format"><option value="local" {{if eq .Ctx.TimeFormat "local"}}selected{{end}}>{{timeExample .Ctx "local"}}</option><option value="iso" {{if eq .Ctx.TimeFormat "iso"}}selected{{end}}>{{timeExample .Ctx "iso"}}</option><option value="us" {{if eq .Ctx.TimeFormat "us"}}selected{{end}}>{{timeExample .Ctx "us"}}</option><option value="eu" {{if eq .Ctx.TimeFormat "eu"}}selected{{end}}>{{timeExample .Ctx "eu"}}</option><option value="24h" {{if eq .Ctx.TimeFormat "24h"}}selected{{end}}>{{timeExample .Ctx "24h"}}</option></select></label><button class="primary">{{t .Ctx "settings.save"}}</button></form></section>{{else if eq .Title "reports"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "admin.reports"}}</p><h1>{{t .Ctx "reports.title"}}</h1></div><a class="button primary" href="/admin/reports/export.csv">{{t .Ctx "reports.export"}}</a></div><section class="card"><div class="report-filters"><label>{{t .Ctx "reports.date_range"}}<input value="{{t .Ctx "reports.last_7_days"}}" disabled></label><label>{{t .Ctx "reports.product"}}<select disabled><option>{{t .Ctx "reports.all_products"}}</option></select></label><label>{{t .Ctx "reports.place"}}<select disabled><option>{{t .Ctx "reports.all_places"}}</option></select></label></div><div class="chart-placeholder mt">{{t .Ctx "reports.chart"}}</div></section><section class="section-header"><h2>{{t .Ctx "reports.preview"}}</h2></section><div class="stack">{{range .Data}}<div class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}}">{{eventSign .Qty .Type}}</div><div><strong class="event-product-line"><span class="product-badge {{productClass .Product}}" style="{{productStyle .Color}}">{{.Product}}</span></strong><p class="event-amount-line">{{eventAmountText $.Ctx .Type .Qty .Unit}}</p><p class="muted event-meta"><span>{{.Place}}</span><span class="event-time">{{formatTime $.Ctx .Time}}</span></p></div></div>{{else}}<div class="empty-state">{{t .Ctx "reports.empty"}}</div>{{end}}</div>{{else if eq .Title "result"}}<section class="hero-result {{productClass (index .Data "Product")}}" style="{{productStyle (index .Data "Color")}}"><span class="result-action">{{if gt (index .Data "Delta") 0}}{{t .Ctx "result.added"}}{{else if lt (index .Data "Delta") 0}}{{t .Ctx "result.subtracted"}}{{else}}{{t .Ctx "result.event"}}{{end}}</span><div class="result-amount">{{index .Data "Amount"}} ×</div><h1>{{index .Data "Product"}}</h1><p class="result-place">{{if gt (index .Data "Delta") 0}}{{t .Ctx "result.to"}}{{else}}{{t .Ctx "result.from"}}{{end}} {{index .Data "Place"}}</p><div class="current-stock"><p class="eyebrow">{{t .Ctx "result.current"}}</p><strong class="stock-qty">{{index .Data "Stock"}} {{unit .Ctx (index .Data "Unit")}}</strong></div><p class="muted mt">{{t .Ctx "result.created"}} {{formatTime .Ctx (index .Data "Created")}}</p></section>{{if index .Data "Negative"}}<p class="status-banner status-warning mt"><strong>{{t .Ctx "result.warning"}}</strong> {{t .Ctx "result.negative"}} {{index .Data "Stock"}} {{unit .Ctx (index .Data "Unit")}}.</p>{{end}}<div id="undo" class="undo-panel mt">{{if not (index .Data "Reversed")}}<p><strong>{{t .Ctx "result.undoq"}}</strong><br><span class="muted">{{t .Ctx "result.undocopy"}}</span></p><form hx-post="/events/{{index .Data "ID"}}/undo" hx-target="#undo" method="post">{{csrf .Ctx}}<button class="danger full" _="on load set n to {{index .Data "UndoSeconds"}} then repeat while n > 0 set my.innerText to '{{t .Ctx "result.undo"}} · ' + n + 's' wait 1s decrement n end then set my.disabled to true then set my.innerText to '{{t .Ctx "result.undo_expired"}}'">{{t .Ctx "result.undo"}} · {{index .Data "UndoSeconds"}}s</button></form>{{else}}<div class="success"><strong>{{t .Ctx "result.undone"}}</strong><p>{{t .Ctx "result.undone_copy"}}</p></div>{{end}}</div><section class="card mt"><h2>{{t .Ctx "place.scannext"}}</h2><p>{{t .Ctx "result.scan_copy"}}</p><p class="muted">{{t .Ctx "result.scan_later"}}</p></section>{{end}}{{end}}
+{{define "login"}}{{template "layout" .}}{{end}}{{define "body"}}{{if eq .Title "login"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">{{t .Ctx "login.tag"}}</p><h1>{{t .Ctx "login.title"}}</h1><p class="muted">{{t .Ctx "login.copy"}}</p><a class="button primary full" href="/auth/login?return={{.Data}}">{{t .Ctx "login.submit"}}</a></div></section>{{else}}{{template "body2" .}}{{end}}{{end}}
+{{define "body2"}}{{if eq .Title "register"}}<section class="auth-wrap"><div class="auth-card"><a class="wordmark" href="/places"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</a><p class="eyebrow mt">{{t .Ctx "login.tag"}}</p><h1>{{t .Ctx "login.title"}}</h1><p class="muted">{{t .Ctx "login.copy"}}</p><a class="button primary full" href="/auth/login">{{t .Ctx "login.submit"}}</a></div></section>{{else if eq .Title "waiting"}}<section class="card status-info"><p class="eyebrow">{{t .Ctx "waiting.eyebrow"}}</p><h1>{{t .Ctx "waiting.title"}}</h1><p>{{t .Ctx "waiting.added"}}</p><p>{{t .Ctx "waiting.copy"}}</p><form method="post" action="/logout">{{csrf .Ctx}}<button class="secondary">{{t .Ctx "waiting.switch"}}</button></form></section>{{else if eq .Title "error"}}<section class="card status-danger"><p class="eyebrow">{{t .Ctx "error.eyebrow"}}</p><h1>{{index .Data "Message"}}</h1><div class="row mt"><a class="button primary" href="/places">{{t .Ctx "error.home"}}</a><a class="button secondary" href="/login">{{t .Ctx "error.login"}}</a></div></section>{{else if eq .Title "places"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "places.eyebrow"}}</p><h1>{{t .Ctx "places.title"}}</h1><p class="muted">{{t .Ctx "places.copy"}}</p></div><a class="button secondary" href="/dev/qr-codes">{{t .Ctx "places.devqr"}}</a></div><div class="grid">{{range .Data}}<a class="place-card" href="/places/{{.Token}}"><div class="place-card-header"><span class="place-icon" aria-hidden="true"><i data-lucide="package"></i></span><h2>{{.Name}}</h2></div><dl class="place-overview">{{range .Overview}}<div class="place-overview-item {{productClass .Name}}" style="{{productStyle .Color}}"><dt>{{.Name}}</dt><dd><strong>{{.Qty}}</strong> {{.Unit}}</dd></div>{{else}}<div class="place-overview-empty">{{t $.Ctx "places.cardcopy"}}</div>{{end}}</dl></a>{{else}}<div class="empty-state">{{t .Ctx "places.empty"}}</div>{{end}}</div>{{else if eq .Title "place"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "place.eyebrow"}}</p><h1>{{index .Data "Name"}}</h1><p class="muted">{{t .Ctx "place.stock"}}</p></div>{{if eq .Ctx.Role "admin"}}<span class="pill">{{t .Ctx "place.approved"}}</span>{{end}}</div><div class="grid two">{{range index .Data "Stocks"}}<article class="product-card {{productClass .Name}} {{if lt .Qty 0}}negative{{end}}" style="{{productStyle .Color}}"><span class="product-badge {{productClass .Name}}" style="{{productStyle .Color}}">{{.Name}}</span><div class="stock-qty">{{.Qty}}</div><p class="muted">{{unit $.Ctx .Unit}} {{t $.Ctx "place.here"}}</p>{{if lt .Qty 0}}<p class="status-banner status-warning">{{t $.Ctx "place.negative"}}</p>{{else if eq .Qty 0}}<p class="muted">{{t $.Ctx "place.zero"}}</p>{{end}}</article>{{else}}<div class="empty-state">{{t .Ctx "products.empty"}}</div>{{end}}</div><section class="section-header"><h2>{{t .Ctx "place.recent"}}</h2><a href="/events">{{t .Ctx "place.viewall"}}</a></section><div class="empty-state">{{t .Ctx "place.recentempty"}}</div><section class="card mt"><h2>{{t .Ctx "nav.manual"}}</h2><p class="muted">{{t .Ctx "manual.copy"}}</p><a class="button secondary full" href="/manual?place_token={{index .Data "Token"}}">{{t .Ctx "nav.manual"}}</a></section>{{else if eq .Title "scan"}}<section class="scanner-page"><div class="page-header"><div><p class="eyebrow">{{t .Ctx "nav.scan"}}</p><h1>{{t .Ctx "scan.title"}}</h1><p class="muted">{{t .Ctx "scan.copy"}}</p></div><a class="button ghost icon-button" href="/places" title="{{t .Ctx "scan.cancel"}}"><i data-lucide="x" aria-hidden="true"></i></a></div><div class="scanner-card"><video id="qr-video" class="scanner-video" autoplay muted playsinline aria-label="{{t .Ctx "scan.title"}}"></video><div class="scanner-frame" aria-hidden="true"></div><div class="scanner-controls"><p id="scan-status" class="status-banner status-info">{{t .Ctx "scan.starting"}}</p><div class="scanner-actions"><button id="camera-start" class="secondary" type="button">{{t .Ctx "scan.start_button"}}</button></div></div></div><script>(()=>{function sizeScanPage(){document.documentElement.style.setProperty("--scan-vh",((window.visualViewport&&window.visualViewport.height)||window.innerHeight)+"px");}sizeScanPage();window.visualViewport&&window.visualViewport.addEventListener("resize",sizeScanPage);window.addEventListener("orientationchange",sizeScanPage);function pathFrom(raw){try{const u=new URL(raw,window.location.href);if(u.origin!==window.location.origin)return "";if(!u.pathname.startsWith("/scan/")||u.pathname==="/scan/")return "";return u.pathname+u.search+u.hash;}catch(e){return "";}}function openScan(raw){const path=pathFrom(raw);if(!path)return false;window.location.assign(path);return true;}window.ZestQRScanner&&window.ZestQRScanner.create({video:document.getElementById("qr-video"),status:document.getElementById("scan-status"),startButton:document.getElementById("camera-start"),stopButton:document.querySelector('.scanner-page a[href="/places"]'),messages:{starting:{{printf "%q" (t .Ctx "scan.starting")}},scanning:{{printf "%q" (t .Ctx "scan.ready")}},found:{{printf "%q" (t .Ctx "scan.found")}},unavailable:{{printf "%q" (t .Ctx "scan.unavailable")}},denied:{{printf "%q" (t .Ctx "scan.denied")}},none:{{printf "%q" (t .Ctx "scan.none")}},failed:{{printf "%q" (t .Ctx "scan.failed")}},insecure:{{printf "%q" (t .Ctx "scan.insecure")}}},onScanSuccess:function(result){if(!openScan(result)){document.getElementById("scan-status").textContent={{printf "%q" (t .Ctx "error.invalid_qr")}};}},onScanError:function(){}});})();</script></section>{{else if eq .Title "events"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "events.eyebrow"}}</p><h1>{{t .Ctx "events.title"}}</h1></div></div><div class="stack">{{range .Data}}<article class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}} {{if eq .Type "reversal"}}reversal{{end}}">{{eventSign .Qty .Type}}</div><div><strong class="event-product-line"><span class="product-badge {{productClass .Product}}" style="{{productStyle .Color}}">{{.Product}}</span></strong><p class="event-amount-line">{{eventAmountText $.Ctx .Type .Qty .Unit}}</p><p class="muted event-meta"><span>{{.Place}} · {{.User}}</span><span class="event-time">{{formatTime $.Ctx .Time}}</span></p><span class="pill">{{.Type}}</span></div></article>{{else}}<div class="empty-state">{{t .Ctx "events.empty"}}</div>{{end}}</div>{{else if eq .Title "manual"}}<section class="card manual-flow"><p class="eyebrow">{{t .Ctx "manual.eyebrow"}}</p><h1>{{t .Ctx "manual.title"}}</h1><p class="muted">{{t .Ctx "manual.copy"}}</p><form method="post" class="manual-form mt">{{csrf .Ctx}}<label>{{t .Ctx "manual.place"}}<select name="place_id" required>{{range .Data.Places}}<option value="{{.ID}}" {{if eq $.Data.SelectedPlace .ID}}selected{{end}}>{{.Name}}</option>{{end}}</select></label><label>{{t .Ctx "manual.product"}}<select name="product_id" required>{{range .Data.Products}}<option value="{{.ID}}">{{.Name}} · {{unit $.Ctx .Unit}}</option>{{end}}</select></label><label>{{t .Ctx "manual.amount"}}<input name="amount" type="number" inputmode="numeric" min="1" value="{{with index .Data.Amounts 0}}{{.}}{{else}}1{{end}}" required></label><div class="amount-chips">{{range .Data.Amounts}}<button class="secondary" type="button" onclick="this.form.amount.value='{{.}}'">{{.}}</button>{{end}}</div><div class="manual-actions"><button class="primary" name="action" value="add"><i data-lucide="plus" aria-hidden="true"></i>{{t .Ctx "manual.add"}}</button><button class="secondary" name="action" value="subtract"><i data-lucide="minus" aria-hidden="true"></i>{{t .Ctx "manual.subtract"}}</button></div></form></section>{{else if eq .Title "admin"}}<p class="eyebrow">{{t .Ctx "admin.backoffice"}}</p><h1>{{t .Ctx "admin.title"}}</h1><div class="admin-grid"><div class="metric-card"><span>{{t .Ctx "admin.total"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.today"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.approvals"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.negative"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.activeplaces"}}</span><strong>—</strong></div><div class="metric-card"><span>{{t .Ctx "admin.activeproducts"}}</span><strong>—</strong></div></div><div class="card mt"><h2>{{t .Ctx "admin.reports_settings"}}</h2><p class="muted">{{t .Ctx "admin.coming_soon"}}</p></div>{{else if eq .Title "members"}}<h1>{{t .Ctx "admin.approvals"}}</h1><div class="table-card"><table><thead><tr><th>{{t .Ctx "members.user"}}</th><th>{{t .Ctx "members.status"}}</th><th>{{t .Ctx "members.actions"}}</th></tr></thead><tbody>{{range .Data}}<tr><td><strong>{{.Name}}</strong><br><span class="muted">{{.Email}}</span></td><td><span class="pill">{{.Status}}</span></td><td><form method="post" action="/admin/memberships/{{.ID}}/approve">{{csrf $.Ctx}}<button>{{t $.Ctx "members.approve"}}</button></form><form method="post" action="/admin/memberships/{{.ID}}/reject">{{csrf $.Ctx}}<button class="secondary">{{t $.Ctx "members.reject"}}</button></form></td></tr>{{else}}<tr><td colspan="3">{{t .Ctx "members.none"}}</td></tr>{{end}}</tbody></table></div>{{else if eq .Title "products"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "admin.products"}}</p><h1>{{t .Ctx "admin.products"}}</h1><p class="muted">{{t .Ctx "products.copy"}}</p></div><details class="new-product-menu"><summary class="button primary">{{t .Ctx "products.add"}}</summary><form class="product-management-form card" method="post" action="/admin/products">{{csrf .Ctx}}<input type="hidden" name="action" value="create"><h2>{{t .Ctx "products.add"}}</h2><div class="product-form-grid"><label>{{t .Ctx "products.name"}}<input name="name" required placeholder="Lemon"></label><label>{{t .Ctx "products.code"}}<input name="code" required placeholder="LEMON"></label><label>{{t .Ctx "products.unit"}}<input name="unit" value="units" required></label><label>{{t .Ctx "products.color"}}<input type="color" name="color" value="#F5B700"></label><button class="primary">{{t .Ctx "products.add"}}</button></div></form></details></div><div class="product-list" role="list">{{range .Data}}<details class="product-list-item {{if not .Active}}is-archived{{end}}" style="{{productStyle .Color}}" role="listitem"><summary><span class="product-badge {{productClass .Name}}" style="{{productStyle .Color}}">{{.Name}}</span><span class="muted product-list-meta">{{.Code}} · {{.Unit}}</span><span class="pill">{{if .Active}}{{t $.Ctx "products.active"}}{{else}}{{t $.Ctx "products.archived"}}{{end}}</span></summary><div class="product-editor"><form id="save-{{.ID}}" class="product-management-form" method="post" action="/admin/products">{{csrf $.Ctx}}<input type="hidden" name="action" value="save"><input type="hidden" name="product_id" value="{{.ID}}"><div class="product-form-grid"><label>{{t $.Ctx "products.name"}}<input name="name" value="{{.Name}}" required></label><label>{{t $.Ctx "products.code"}}<input name="code" value="{{.Code}}" required></label><label>{{t $.Ctx "products.unit"}}<input name="unit" value="{{.Unit}}" required></label><label>{{t $.Ctx "products.color"}}<input type="color" name="color" value="{{.Color}}"></label><button class="secondary">{{t $.Ctx "products.save"}}</button></div></form><form method="post" action="/admin/products">{{csrf $.Ctx}}<input type="hidden" name="product_id" value="{{.ID}}"><input type="hidden" name="action" value="{{if .Active}}archive{{else}}restore{{end}}"><button class="{{if .Active}}danger{{else}}secondary{{end}}">{{if .Active}}{{t $.Ctx "products.archive"}}{{else}}{{t $.Ctx "products.restore"}}{{end}}</button></form></div></details>{{else}}<div class="empty-state">{{t .Ctx "products.empty"}}</div>{{end}}</div>{{else if eq .Title "places_admin"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "places.title"}}</p><h1>{{t .Ctx "places.title"}}</h1><p class="muted">{{t .Ctx "places.admin_copy"}}</p></div><details class="new-product-menu"><summary class="button primary">{{t .Ctx "places.add"}}</summary><form class="product-management-form card" method="post" action="/admin/places">{{csrf .Ctx}}<input type="hidden" name="action" value="create"><h2>{{t .Ctx "places.add"}}</h2><div class="product-form-grid"><label>{{t .Ctx "places.name"}}<input name="name" required placeholder="Warehouse"></label><button class="primary">{{t .Ctx "places.add"}}</button></div></form></details></div><div class="product-list" role="list">{{range .Data}}<details class="product-list-item {{if not .Active}}is-archived{{end}}" role="listitem"><summary><span class="admin-place-list-name"><span class="place-icon small" aria-hidden="true"><i data-lucide="package"></i></span><span>{{.Name}}</span></span><span class="pill">{{if .Active}}{{t $.Ctx "places.active"}}{{else}}{{t $.Ctx "places.archived"}}{{end}}</span></summary><div class="product-editor"><form id="save-{{.ID}}" class="product-management-form" method="post" action="/admin/places">{{csrf $.Ctx}}<input type="hidden" name="action" value="save"><input type="hidden" name="place_id" value="{{.ID}}"><div class="product-form-grid"><label>{{t $.Ctx "places.name"}}<input name="name" value="{{.Name}}" required></label><button class="secondary">{{t $.Ctx "places.save"}}</button></div></form><form method="post" action="/admin/places" {{if and .Active .HasStock}}onsubmit="return confirm('{{t $.Ctx "places.archive_confirm"}}')"{{end}}>{{csrf $.Ctx}}<input type="hidden" name="place_id" value="{{.ID}}"><input type="hidden" name="action" value="{{if .Active}}archive{{else}}restore{{end}}"><button class="{{if .Active}}danger{{else}}secondary{{end}}">{{if .Active}}{{t $.Ctx "places.archive"}}{{else}}{{t $.Ctx "places.restore"}}{{end}}</button></form></div></details>{{else}}<div class="empty-state">{{t .Ctx "places.empty"}}</div>{{end}}</div>{{else if eq .Title "printqr"}}<div class="page-header no-print"><div><p class="eyebrow">{{t .Ctx "qr.matrices"}}</p><h1>{{t .Ctx "printqr.title"}}</h1><p class="muted">{{t .Ctx "printqr.copy"}}</p></div><button class="secondary" onclick="window.print()">{{t .Ctx "printqr.print"}}</button></div><section class="card no-print"><h2>{{t .Ctx "printqr.add"}}</h2><form method="post" class="printqr-form" data-printqr-form>{{csrf .Ctx}}<input type="hidden" name="action" value="create"><label data-printqr-field="kind">{{t .Ctx "printqr.kind"}}<select name="kind" data-printqr-kind><option value="home">{{t .Ctx "printqr.open_home"}}</option><option value="place">{{t .Ctx "qr.open_place"}}</option><option value="command">{{t .Ctx "printqr.command"}}</option></select></label><label data-printqr-field="place">{{t .Ctx "manual.place"}}<select name="place_id">{{range .Data.Places}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label><label data-printqr-field="product">{{t .Ctx "manual.product"}}<select name="product_id">{{range .Data.Products}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select></label><label data-printqr-field="amount">{{t .Ctx "manual.amount"}}<input name="amount" type="number" min="1" value="{{with index .Data.Amounts 0}}{{.}}{{else}}1{{end}}"></label><label data-printqr-field="action">{{t .Ctx "nav.events"}}<select name="command_action"><option value="add">{{t .Ctx "manual.add"}}</option><option value="subtract">{{t .Ctx "manual.subtract"}}</option></select></label><label data-printqr-field="label">{{t .Ctx "printqr.label"}}<input name="label" placeholder="{{t .Ctx "printqr.placeholder"}}"></label><div class="printqr-submit-row"><button class="primary">{{t .Ctx "printqr.add"}}</button></div></form><script>document.querySelectorAll('[data-printqr-form]').forEach(function(form){var kind=form.querySelector('[data-printqr-kind]');var fields={place:form.querySelector('[data-printqr-field="place"]'),product:form.querySelector('[data-printqr-field="product"]'),amount:form.querySelector('[data-printqr-field="amount"]'),action:form.querySelector('[data-printqr-field="action"]')};function setField(name,show){var field=fields[name];if(!field)return;field.classList.toggle('is-hidden',!show);field.querySelectorAll('input,select').forEach(function(control){control.disabled=!show;});}function update(){var value=kind.value;setField('place',value==='place'||value==='command');setField('product',value==='command');setField('amount',value==='command');setField('action',value==='command');}kind.addEventListener('change',update);update();});</script></section><section class="qr-page printqr-page"><div class="row print-only"><div><span class="wordmark"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</span><p class="eyebrow">{{t .Ctx "printqr.title"}}</p></div></div><div class="qrgrid printable-matrix printqr-matrix">{{range .Data.Codes}}<div class="qr {{productClass .Product}}" style="{{productStyle .Color}}"><img alt="QR code for {{.Label}}" src="{{.Img}}"><strong>{{.Label}}</strong>{{if eq .Kind "command"}}<small>{{.Place}}<br>{{.ActionLabel}} {{.Amount}} {{.Product}}</small>{{else if eq .Kind "place"}}<small>{{.Place}}</small>{{else}}<small>{{.Target}}</small>{{end}}<form class="no-print" method="post">{{csrf $.Ctx}}<input type="hidden" name="action" value="delete"><input type="hidden" name="id" value="{{.ID}}"><button class="danger">{{t $.Ctx "printqr.delete"}}</button></form></div>{{else}}<div class="empty-state no-print">{{t .Ctx "printqr.empty"}}</div>{{end}}</div></section>{{else if eq .Title "qr"}}<section class="qr-page"><div class="row"><div><span class="wordmark"><img src="/static/zest-logo.png" alt="" width="32" height="32">Zest</span><p class="eyebrow">{{t .Ctx "qr.matrix"}} · Example Company</p><h1>{{t .Ctx "qr.print_matrix"}}</h1><p class="muted">{{t .Ctx "qr.generated"}}</p></div><button class="secondary no-print" onclick="window.print()">{{t .Ctx "qr.print"}}</button></div><div class="qr-section"><h2>{{t .Ctx "action.add_section"}}</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "add"}}<div class="qr {{productClass .Label}}" style="{{productStyle .Color}}"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>{{t .Ctx "action.subtract_section"}}</h2><div class="qrgrid">{{range .Data}}{{if eq .Action "subtract"}}<div class="qr {{productClass .Label}}" style="{{productStyle .Color}}"><img alt="QR code" src="{{.Img}}"><small>{{.Label}}</small></div>{{end}}{{end}}</div></div><div class="qr-section"><h2>{{t .Ctx "qr.backup"}}</h2><p class="muted">{{t .Ctx "qr.backup_copy"}}</p>{{with index .Data 0}}<a class="qr" href="{{.PlaceURL}}"><img alt="{{t $.Ctx "qr.open_place"}}" src="{{.PlaceImg}}"><small>{{t $.Ctx "qr.open_place"}}</small></a>{{end}}</div></section>{{else if eq .Title "devqr"}}<section class="qr-page"><div class="row"><div><p class="eyebrow">{{t .Ctx "devqr.matrix"}}</p><h1>{{t .Ctx "devqr.title"}}</h1><p class="muted">{{t .Ctx "devqr.copy"}}</p></div><button class="secondary no-print" onclick="window.print()">{{t .Ctx "qr.print_matrix"}}</button></div><div class="qrgrid printable-matrix">{{range .Data}}<a class="qr {{productClass .Product}}" style="{{productStyle .Color}}" href="{{.Href}}"><img alt="QR code for {{.ActionLabel}} {{.Amount}} {{.Product}} at {{.Place}}" src="{{.Img}}"><small>{{.Place}}<br>{{.ActionLabel}} {{.Amount}} {{.Product}}</small></a>{{end}}</div></section>{{else if eq .Title "settings"}}<section class="card"><p class="eyebrow">{{t .Ctx "nav.settings"}}</p><h1>{{t .Ctx "settings.title"}}</h1><p class="muted">{{t .Ctx "settings.copy"}}</p>{{if index .Data "Saved"}}<p class="status-banner status-success">{{t .Ctx "settings.saved"}}</p>{{end}}<form method="post" class="mt">{{csrf .Ctx}}<label>{{t .Ctx "settings.language"}}<select name="language"><option value="" {{if eq .Ctx.LangPref ""}}selected{{end}}>{{t .Ctx "settings.device"}}</option><option value="en" {{if eq .Ctx.LangPref "en"}}selected{{end}}>{{t .Ctx "settings.english"}}</option><option value="de" {{if eq .Ctx.LangPref "de"}}selected{{end}}>{{t .Ctx "settings.german"}}</option></select></label><label>{{t .Ctx "settings.time_format"}}<select name="time_format"><option value="local" {{if eq .Ctx.TimeFormat "local"}}selected{{end}}>{{timeExample .Ctx "local"}}</option><option value="iso" {{if eq .Ctx.TimeFormat "iso"}}selected{{end}}>{{timeExample .Ctx "iso"}}</option><option value="us" {{if eq .Ctx.TimeFormat "us"}}selected{{end}}>{{timeExample .Ctx "us"}}</option><option value="eu" {{if eq .Ctx.TimeFormat "eu"}}selected{{end}}>{{timeExample .Ctx "eu"}}</option><option value="24h" {{if eq .Ctx.TimeFormat "24h"}}selected{{end}}>{{timeExample .Ctx "24h"}}</option></select></label><button class="primary">{{t .Ctx "settings.save"}}</button></form></section>{{else if eq .Title "reports"}}<div class="page-header"><div><p class="eyebrow">{{t .Ctx "admin.reports"}}</p><h1>{{t .Ctx "reports.title"}}</h1></div><a class="button primary" href="/admin/reports/export.csv">{{t .Ctx "reports.export"}}</a></div><section class="card"><div class="report-filters"><label>{{t .Ctx "reports.date_range"}}<input value="{{t .Ctx "reports.last_7_days"}}" disabled></label><label>{{t .Ctx "reports.product"}}<select disabled><option>{{t .Ctx "reports.all_products"}}</option></select></label><label>{{t .Ctx "reports.place"}}<select disabled><option>{{t .Ctx "reports.all_places"}}</option></select></label></div><div class="chart-placeholder mt">{{t .Ctx "reports.chart"}}</div></section><section class="section-header"><h2>{{t .Ctx "reports.preview"}}</h2></section><div class="stack">{{range .Data}}<div class="event-card"><div class="event-sign {{if lt .Qty 0}}minus{{end}}">{{eventSign .Qty .Type}}</div><div><strong class="event-product-line"><span class="product-badge {{productClass .Product}}" style="{{productStyle .Color}}">{{.Product}}</span></strong><p class="event-amount-line">{{eventAmountText $.Ctx .Type .Qty .Unit}}</p><p class="muted event-meta"><span>{{.Place}}</span><span class="event-time">{{formatTime $.Ctx .Time}}</span></p></div></div>{{else}}<div class="empty-state">{{t .Ctx "reports.empty"}}</div>{{end}}</div>{{else if eq .Title "result"}}<section class="hero-result {{productClass (index .Data "Product")}}" style="{{productStyle (index .Data "Color")}}"><span class="result-action">{{if gt (index .Data "Delta") 0}}{{t .Ctx "result.added"}}{{else if lt (index .Data "Delta") 0}}{{t .Ctx "result.subtracted"}}{{else}}{{t .Ctx "result.event"}}{{end}}</span><div class="result-amount">{{index .Data "Amount"}} ×</div><h1>{{index .Data "Product"}}</h1><p class="result-place">{{if gt (index .Data "Delta") 0}}{{t .Ctx "result.to"}}{{else}}{{t .Ctx "result.from"}}{{end}} {{index .Data "Place"}}</p><div class="current-stock"><p class="eyebrow">{{t .Ctx "result.current"}}</p><strong class="stock-qty">{{index .Data "Stock"}} {{unit .Ctx (index .Data "Unit")}}</strong></div><p class="muted mt">{{t .Ctx "result.created"}} {{formatTime .Ctx (index .Data "Created")}}</p></section>{{if index .Data "Negative"}}<p class="status-banner status-warning mt"><strong>{{t .Ctx "result.warning"}}</strong> {{t .Ctx "result.negative"}} {{index .Data "Stock"}} {{unit .Ctx (index .Data "Unit")}}.</p>{{end}}<div id="undo" class="undo-panel mt">{{if not (index .Data "Reversed")}}<p><strong>{{t .Ctx "result.undoq"}}</strong><br><span class="muted">{{t .Ctx "result.undocopy"}}</span></p><form hx-post="/events/{{index .Data "ID"}}/undo" hx-target="#undo" method="post">{{csrf .Ctx}}<button class="danger full" _="on load set n to {{index .Data "UndoSeconds"}} then repeat while n > 0 set my.innerText to '{{t .Ctx "result.undo"}} · ' + n + 's' wait 1s decrement n end then set my.disabled to true then set my.innerText to '{{t .Ctx "result.undo_expired"}}'">{{t .Ctx "result.undo"}} · {{index .Data "UndoSeconds"}}s</button></form>{{else}}<div class="success"><strong>{{t .Ctx "result.undone"}}</strong><p>{{t .Ctx "result.undone_copy"}}</p></div>{{end}}</div><section class="card mt"><h2>{{t .Ctx "place.scannext"}}</h2><p>{{t .Ctx "result.scan_copy"}}</p><p class="muted">{{t .Ctx "result.scan_later"}}</p></section>{{end}}{{end}}
 {{define "register"}}{{template "layout" .}}{{end}}
 {{define "waiting"}}{{template "layout" .}}{{end}}
 {{define "error"}}{{template "layout" .}}{{end}}

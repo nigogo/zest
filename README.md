@@ -26,13 +26,18 @@ DATABASE_PATH=./data/app.db
 SESSION_SECRET=dev-secret-change-me
 UNDO_WINDOW_SECONDS=20
 COMMON_AMOUNTS=10,20,40,60
-SEED_ADMIN_EMAIL=admin@example.com
-SEED_ADMIN_PASSWORD=admin123-change-me
-SEED_USER_EMAIL=user@example.com
-SEED_USER_PASSWORD=password
+AUTH0_DOMAIN=
+AUTH0_ISSUER=
+AUTH0_CLIENT_ID=
+AUTH0_CLIENT_SECRET=
+AUTH0_CALLBACK_URL=http://localhost:8765/auth/callback
+AUTH0_LOGOUT_RETURN_URL=http://localhost:8765/login
+ALLOWED_EMAILS=
+ADMIN_EMAILS=
+DEFAULT_ORG_ID=org_dev
 ```
 
-When `APP_ENV=production`, set `APP_BASE_URL` to the public production URL and replace `SESSION_SECRET` and `SEED_ADMIN_PASSWORD`; the server refuses to start with the local defaults for those values.
+When `APP_ENV=production`, set `APP_BASE_URL` to the public production URL, replace `SESSION_SECRET`, and configure the Auth0 variables. The server refuses to start with the local session secret or without required Auth0 settings.
 
 ## Setup and Run
 
@@ -51,23 +56,11 @@ The database migrates and development seed data is created on first startup.
 
 Users can choose English, German, or device default from `/settings`; that preference is stored in SQLite.
 
-## Seed Credentials
+## Authentication
 
-Development admin:
+Zest uses Auth0 with the OpenID Connect Authorization Code Flow. `/login` starts a normal browser redirect through `/auth/login`, `/auth/callback` validates the ID token, and the app then creates its own HttpOnly session cookie. Do not store Auth0 access tokens, ID tokens, or refresh tokens in browser-accessible storage.
 
-```txt
-admin@example.com
-admin123-change-me
-```
-
-Development approved operator:
-
-```txt
-user@example.com
-password
-```
-
-These credentials are for local development only. Override them with `SEED_ADMIN_EMAIL`, `SEED_ADMIN_PASSWORD`, `SEED_USER_EMAIL`, and `SEED_USER_PASSWORD`.
+For local development, configure an Auth0 application with `http://localhost:8765/auth/callback` as an allowed callback URL and `http://localhost:8765/login` as an allowed logout URL. Use `ALLOWED_EMAILS` for first-phase operator access and `ADMIN_EMAILS` for first-phase admin access; emails must be verified by Auth0.
 
 ## QR Command Tokens
 
@@ -87,7 +80,6 @@ The scan result page shows an HTMX undo button with a 20-second countdown. The s
 
 - QR images are placeholder SVG data URIs in this environment; swap in a real QR generator before production printing.
 - Admin place/product creation routes are intentionally minimal in this MVP.
-- Password hashing is structured in one helper; replace with Argon2id/bcrypt when external crypto modules are available.
 
 ## Next Steps
 
